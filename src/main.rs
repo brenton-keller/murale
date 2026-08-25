@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -37,6 +37,8 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 extern "C" fn handle_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Relaxed);
 }
+
+const MPV_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 3600);
 
 fn render_nonblocking(
     ctx: *mut libmpv2_sys::mpv_render_context,
@@ -72,18 +74,45 @@ fn render_nonblocking(
     unsafe { libmpv2_sys::mpv_render_context_render(ctx, params.as_mut_ptr()) }
 }
 
+// --- mpv options parsing ---
+
+fn parse_mpv_options(opts: &str) -> Vec<(&str, &str)> {
+    opts.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|opt| {
+            if let Some((key, value)) = opt.split_once('=') {
+                (key.trim(), value.trim())
+            } else {
+                (opt, "inf")
+            }
+        })
+        .collect()
+}
+
 // --- Hyprland workspace switching ---
 
-struct MpvHandle(*mut libmpv2_sys::mpv_handle);
-unsafe impl Send for MpvHandle {}
+struct SendPtr(*mut libmpv2_sys::mpv_handle);
+unsafe impl Send for SendPtr {}
 
-fn mpv_loadfile(handle: &MpvHandle, path: &str) {
+type SharedMpvPtr = Arc<Mutex<SendPtr>>;
+
+fn mpv_loadfile(shared: &SharedMpvPtr, path: &str) {
+    let guard = match shared.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let handle = guard.0;
+    if handle.is_null() {
+        return;
+    }
     let Ok(cmd) = CString::new("loadfile") else { return };
     let Ok(path_c) = CString::new(path) else { return };
     let args = [cmd.as_ptr(), path_c.as_ptr(), std::ptr::null()];
     unsafe {
-        libmpv2_sys::mpv_command(handle.0, args.as_ptr() as *mut *const _);
+        libmpv2_sys::mpv_command(handle, args.as_ptr() as *mut *const _);
     }
+    // Guard drops here — lock released after mpv_command completes
 }
 
 fn get_active_workspace() -> Option<String> {
@@ -98,7 +127,7 @@ fn get_active_workspace() -> Option<String> {
 }
 
 fn spawn_workspace_listener(
-    mpv_handle: MpvHandle,
+    mpv_ptr: SharedMpvPtr,
     workspace_map: HashMap<String, String>,
     default_video: String,
 ) -> Option<std::thread::JoinHandle<()>> {
@@ -120,7 +149,7 @@ fn spawn_workspace_listener(
         if let Some(video) = workspace_map.get(&active) {
             if *video != default_video {
                 tracing::info!("workspace {active}: loading {video}");
-                mpv_loadfile(&mpv_handle, video);
+                mpv_loadfile(&mpv_ptr, video);
             }
         }
     }
@@ -160,13 +189,11 @@ fn spawn_workspace_listener(
 
             let line = buf.trim_end();
             if let Some(name) = line.strip_prefix("workspace>>") {
-                let video = workspace_map
-                    .get(name)
-                    .unwrap_or(&default_video);
+                let video = workspace_map.get(name).unwrap_or(&default_video);
 
                 if *video != current_video {
                     tracing::info!("workspace {name}: loading {video}");
-                    mpv_loadfile(&mpv_handle, video);
+                    mpv_loadfile(&mpv_ptr, video);
                     current_video = video.clone();
                 }
             }
@@ -250,8 +277,8 @@ struct Cli {
     #[arg(short, long, value_name = "N=PATH")]
     workspace: Vec<String>,
 
-    /// Pass options to mpv as comma-separated key=value pairs.
-    /// Example: --mpv-options "input-ipc-server=/tmp/murale.sock,volume=0"
+    /// Pass options to mpv as comma-separated key=value pairs. Bare flags are
+    /// set to "inf". Example: --mpv-options "input-ipc-server=/tmp/murale.sock,loop"
     #[arg(long, value_name = "OPTIONS")]
     mpv_options: Option<String>,
 
@@ -274,8 +301,8 @@ struct Murale {
     layer: Option<LayerSurface>,
     target_output_name: Option<String>,
 
-    // EGL — display/config/context survive output reconnects.
-    // Only the per-surface EglState is recreated.
+    // EGL — display/config/context survive output reconnects and mpv refreshes.
+    // Only the per-surface EglState is recreated on reconnect.
     egl_instance: Arc<egl::EglInstance>,
     egl_state: Option<egl::EglState>,
     egl_display: kegl::Display,
@@ -285,6 +312,11 @@ struct Murale {
     // SAFETY: render_ctx MUST be declared before mpv — see transmute comment in init_mpv().
     render_ctx: Option<RenderContext<'static>>,
     mpv: Option<Mpv>,
+
+    // Shared mpv handle pointer — workspace thread locks this for the
+    // duration of each mpv_command call. refresh_mpv locks it to swap
+    // the pointer, providing mutual exclusion.
+    mpv_ptr: SharedMpvPtr,
 
     // mpv wakeup eventfd
     wakeup_fd: EventFd,
@@ -298,6 +330,9 @@ struct Murale {
     frame_callback_pending: bool,
     redraw_needed: bool,
     frame_count: u64,
+
+    // Periodic mpv refresh to counter residual GPU memory leak
+    last_mpv_refresh: Instant,
 
     // Instrumentation
     stats_enabled: bool,
@@ -328,9 +363,6 @@ impl Murale {
         layer.set_size(0, 0);
         layer.commit();
         self.layer = Some(layer);
-
-        // Reset so configure handler creates new EGL surface
-        // (mpv/render_ctx survive — only the EGL surface is per-output)
         self.first_configure = true;
         self.frame_callback_pending = false;
         self.redraw_needed = false;
@@ -371,16 +403,11 @@ impl Murale {
             return;
         }
 
-        // NVIDIA workaround: proprietary drivers leave GL_NONE after eglMakeCurrent
         unsafe {
             gl::DrawBuffer(gl::BACK);
             gl::Viewport(0, 0, w, h);
         }
 
-        // Call mpv_render_context_render directly with BLOCK_FOR_TARGET_TIME=0.
-        // libmpv2's safe render() omits this param, causing mpv to block until
-        // PTS time — unacceptable at 240Hz where the compositor delivers frame
-        // callbacks every 4.17ms.
         let err = render_nonblocking(render_ctx.ctx, w, h);
         if err < 0 {
             tracing::error!("mpv render failed: {err}");
@@ -397,16 +424,12 @@ impl Murale {
             }
         }
 
-        // Register next frame callback before swap
         layer
             .wl_surface()
             .frame(&self.qh, layer.wl_surface().clone());
         self.frame_callback_pending = true;
         self.redraw_needed = false;
 
-        // eglSwapBuffers commits the surface internally on Wayland — no explicit commit needed.
-        // If swap fails, no buffer reaches the compositor and the frame callback will never
-        // fire. Reset frame_callback_pending so the next mpv wakeup retries rendering.
         if let Err(e) = self.egl_instance.swap_buffers(egl_state.display, egl_state.surface) {
             tracing::error!("eglSwapBuffers failed: {e:?}");
             self.frame_callback_pending = false;
@@ -471,17 +494,9 @@ impl Murale {
         mpv.set_property("terminal", "no")?;
 
         if let Some(opts) = &self.mpv_options {
-            for opt in opts.split(',') {
-                let opt = opt.trim();
-                if opt.is_empty() {
-                    continue;
-                }
-                if let Some((key, value)) = opt.split_once('=') {
-                    if let Err(e) = mpv.set_property(key.trim(), value.trim()) {
-                        tracing::warn!("failed to set mpv option {key}={value}: {e}");
-                    }
-                } else {
-                    tracing::warn!("invalid mpv option (expected key=value): {opt}");
+            for (key, value) in parse_mpv_options(opts) {
+                if let Err(e) = mpv.set_property(key, value) {
+                    tracing::warn!("failed to set mpv option {key}={value}: {e}");
                 }
             }
         }
@@ -519,11 +534,60 @@ impl Murale {
         // DO NOT reorder the render_ctx/mpv fields without updating this invariant.
         let render_ctx: RenderContext<'static> = unsafe { std::mem::transmute(render_ctx) };
 
+        if let Ok(mut guard) = self.mpv_ptr.lock() {
+            guard.0 = mpv.ctx.as_ptr();
+        }
+
         self.render_ctx = Some(render_ctx);
         self.mpv = Some(mpv);
+        self.last_mpv_refresh = Instant::now();
 
         tracing::info!("playing {}", self.video_path);
         Ok(())
+    }
+
+    fn refresh_mpv(&mut self) {
+        let (path, time_pos) = match &self.mpv {
+            Some(mpv) => {
+                let path: String = mpv
+                    .get_property("path")
+                    .unwrap_or_else(|_| self.video_path.clone());
+                let pos: f64 = mpv.get_property("time-pos").unwrap_or(0.0);
+                (path, pos)
+            }
+            None => return,
+        };
+
+        tracing::info!("refreshing mpv context (periodic leak mitigation)");
+
+        // Lock the mutex and null the pointer — any in-flight workspace
+        // mpv_command will see null and return. The lock ensures no call
+        // is in progress when we drop.
+        if let Ok(mut guard) = self.mpv_ptr.lock() {
+            guard.0 = std::ptr::null_mut();
+        }
+
+        // Drop in order: render_ctx first, then mpv
+        self.render_ctx.take();
+        self.mpv.take();
+
+        if let Err(e) = self.init_mpv() {
+            tracing::error!("mpv refresh failed: {e}");
+            SHUTDOWN.store(true, Ordering::Relaxed);
+            self.exit = true;
+            return;
+        }
+
+        // Seek to the saved position
+        if let Some(mpv) = &self.mpv {
+            if path != self.video_path {
+                let _ = mpv.command("loadfile", &[&path]);
+            }
+            if time_pos > 1.0 {
+                let pos_str = format!("{time_pos:.1}");
+                let _ = mpv.command("seek", &[&pos_str, "absolute"]);
+            }
+        }
     }
 
     fn find_target_output(&self, name: &str) -> Option<wl_output::WlOutput> {
@@ -722,7 +786,6 @@ impl LayerShellHandler for Murale {
                 }
             }
 
-            // Only init mpv on the very first configure — it survives reconnects
             if self.mpv.is_none() {
                 if let Err(e) = self.init_mpv() {
                     tracing::error!("failed to initialize mpv: {e}");
@@ -796,6 +859,8 @@ fn run() -> Result<()> {
         EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_SEMAPHORE,
     )?;
 
+    let mpv_ptr: SharedMpvPtr = Arc::new(Mutex::new(SendPtr(std::ptr::null_mut())));
+
     let mut state = Murale {
         registry_state: RegistryState::new(&globals),
         output_state,
@@ -811,6 +876,7 @@ fn run() -> Result<()> {
         egl_context,
         render_ctx: None,
         mpv: None,
+        mpv_ptr: mpv_ptr.clone(),
         wakeup_fd,
         initialized: false,
         first_configure: true,
@@ -820,6 +886,7 @@ fn run() -> Result<()> {
         frame_callback_pending: false,
         redraw_needed: false,
         frame_count: 0,
+        last_mpv_refresh: Instant::now(),
         stats_enabled: cli.stats,
         frame_stats: FrameStats::new(),
         exit: false,
@@ -867,6 +934,11 @@ fn run() -> Result<()> {
             break;
         }
 
+        // Periodic mpv context refresh to counter residual GPU memory leak
+        if state.mpv.is_some() && state.last_mpv_refresh.elapsed() >= MPV_REFRESH_INTERVAL {
+            state.refresh_mpv();
+        }
+
         let mut mpv_ready = false;
 
         {
@@ -907,12 +979,14 @@ fn run() -> Result<()> {
         }
 
         if workspace_join_handle.is_none() {
-            if let (Some(mpv), Some((ref map, ref default_video))) =
+            if let (Some(_), Some((ref map, ref default_video))) =
                 (&state.mpv, &workspace_map_for_thread)
             {
-                let handle = MpvHandle(mpv.ctx.as_ptr());
-                workspace_join_handle =
-                    spawn_workspace_listener(handle, map.clone(), default_video.clone());
+                workspace_join_handle = spawn_workspace_listener(
+                    mpv_ptr.clone(),
+                    map.clone(),
+                    default_video.clone(),
+                );
             }
         }
 
