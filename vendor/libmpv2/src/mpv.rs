@@ -260,6 +260,25 @@ impl Drop for Mpv {
 }
 
 impl Mpv {
+    /// Consume this handle and fully terminate the mpv core.
+    ///
+    /// Unlike the normal `Drop` (which calls `mpv_destroy` — a detach that
+    /// leaves the core alive while other clients exist), this calls
+    /// `mpv_terminate_destroy` which brings down all clients and waits for
+    /// the core to shut down completely.
+    pub fn terminate_destroy(mut self) {
+        if let Some(cleanup) = self.wakeup_callback_cleanup.take() {
+            cleanup();
+        }
+        let ptr = self.ctx.as_ptr();
+        std::mem::forget(self);
+        unsafe {
+            libmpv2_sys::mpv_terminate_destroy(ptr);
+        }
+    }
+}
+
+impl Mpv {
     /// Create and initialize a new `Mpv` instance with default options. Use
     /// [`with_initializer`](Mpv::with_initializer) instead if you want to
     /// set options.

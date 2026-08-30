@@ -1,11 +1,16 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod egl;
 mod error;
+mod mem;
+mod mpv;
+mod stats;
+mod workspace;
 
 use std::collections::HashMap;
-use std::ffi::{c_void, CString};
-use std::io::{BufRead, BufReader};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::os::unix::net::UnixStream;
+use std::ffi::c_void;
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use khronos_egl as kegl;
-use libmpv2::render::{OpenGLInitParams, RenderContext, RenderParam, RenderParamApiType};
+use libmpv2::render::RenderContext;
 use libmpv2::Mpv;
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 use nix::sys::eventfd::{EfdFlags, EventFd};
@@ -30,49 +35,31 @@ use smithay_client_toolkit::{
 };
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_output, wl_surface};
-use wayland_client::{Connection, QueueHandle};
+use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
+
+use mpv::{render_nonblocking, SendPtr, SharedMpvPtr};
+use stats::FrameStats;
+use workspace::spawn_workspace_listener;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
+static COMMIT_HELD: AtomicBool = AtomicBool::new(false);
+static RELEASE_SIGNAL: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Relaxed);
 }
 
-const MPV_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 3600);
-
-fn render_nonblocking(
-    ctx: *mut libmpv2_sys::mpv_render_context,
-    w: i32,
-    h: i32,
-) -> i32 {
-    let mut fbo = libmpv2_sys::mpv_opengl_fbo {
-        fbo: 0,
-        w,
-        h,
-        internal_format: 0,
-    };
-    let mut flip: i32 = 1;
-    let mut block: i32 = 0;
-    let mut params = [
-        libmpv2_sys::mpv_render_param {
-            type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_OPENGL_FBO,
-            data: &mut fbo as *mut _ as *mut c_void,
-        },
-        libmpv2_sys::mpv_render_param {
-            type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_FLIP_Y,
-            data: &mut flip as *mut _ as *mut c_void,
-        },
-        libmpv2_sys::mpv_render_param {
-            type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
-            data: &mut block as *mut _ as *mut c_void,
-        },
-        libmpv2_sys::mpv_render_param {
-            type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_INVALID,
-            data: std::ptr::null_mut(),
-        },
-    ];
-    unsafe { libmpv2_sys::mpv_render_context_render(ctx, params.as_mut_ptr()) }
+extern "C" fn handle_refresh_signal(_sig: libc::c_int) {
+    REFRESH_REQUESTED.store(true, Ordering::Relaxed);
 }
+
+extern "C" fn handle_release_signal(_sig: libc::c_int) {
+    RELEASE_SIGNAL.store(true, Ordering::Relaxed);
+}
+
+const MPV_REFRESH_INTERVAL: Duration = Duration::from_secs(2 * 3600);
 
 // --- mpv options parsing ---
 
@@ -83,169 +70,13 @@ fn parse_mpv_options(opts: &str) -> Vec<(&str, &str)> {
         .map(|opt| {
             if let Some((key, value)) = opt.split_once('=') {
                 (key.trim(), value.trim())
+            } else if opt == "loop" {
+                ("loop-file", "inf")
             } else {
-                (opt, "inf")
+                (opt, "yes")
             }
         })
         .collect()
-}
-
-// --- Hyprland workspace switching ---
-
-struct SendPtr(*mut libmpv2_sys::mpv_handle);
-unsafe impl Send for SendPtr {}
-
-type SharedMpvPtr = Arc<Mutex<SendPtr>>;
-
-fn mpv_loadfile(shared: &SharedMpvPtr, path: &str) {
-    let guard = match shared.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let handle = guard.0;
-    if handle.is_null() {
-        return;
-    }
-    let Ok(cmd) = CString::new("loadfile") else { return };
-    let Ok(path_c) = CString::new(path) else { return };
-    let args = [cmd.as_ptr(), path_c.as_ptr(), std::ptr::null()];
-    unsafe {
-        libmpv2_sys::mpv_command(handle, args.as_ptr() as *mut *const _);
-    }
-    // Guard drops here — lock released after mpv_command completes
-}
-
-fn get_active_workspace() -> Option<String> {
-    let output = std::process::Command::new("hyprctl")
-        .args(["activeworkspace", "-j"])
-        .output()
-        .ok()?;
-    let json = String::from_utf8(output.stdout).ok()?;
-    let start = json.find("\"name\":\"")? + 8;
-    let end = json[start..].find('"')? + start;
-    Some(json[start..end].to_string())
-}
-
-fn spawn_workspace_listener(
-    mpv_ptr: SharedMpvPtr,
-    workspace_map: HashMap<String, String>,
-    default_video: String,
-) -> Option<std::thread::JoinHandle<()>> {
-    let sig = match std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
-        Ok(s) => s,
-        Err(_) => {
-            tracing::warn!(
-                "--workspace specified but HYPRLAND_INSTANCE_SIGNATURE not set; \
-                 workspace switching disabled"
-            );
-            return None;
-        }
-    };
-
-    let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
-    let socket_path = format!("{xdg}/hypr/{sig}/.socket2.sock");
-
-    if let Some(active) = get_active_workspace() {
-        if let Some(video) = workspace_map.get(&active) {
-            if *video != default_video {
-                tracing::info!("workspace {active}: loading {video}");
-                mpv_loadfile(&mpv_ptr, video);
-            }
-        }
-    }
-
-    let jh = std::thread::spawn(move || {
-        let stream = match UnixStream::connect(&socket_path) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("could not connect to Hyprland event socket: {e}");
-                return;
-            }
-        };
-
-        if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(1))) {
-            tracing::warn!("could not set socket timeout: {e}");
-            return;
-        }
-
-        tracing::info!("workspace switching active ({} mappings)", workspace_map.len());
-
-        let mut reader = BufReader::new(stream);
-        let mut buf = String::new();
-        let mut current_video = default_video.clone();
-
-        loop {
-            if SHUTDOWN.load(Ordering::Relaxed) {
-                break;
-            }
-
-            buf.clear();
-            match reader.read_line(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(_) => break,
-            }
-
-            let line = buf.trim_end();
-            if let Some(name) = line.strip_prefix("workspace>>") {
-                let video = workspace_map.get(name).unwrap_or(&default_video);
-
-                if *video != current_video {
-                    tracing::info!("workspace {name}: loading {video}");
-                    mpv_loadfile(&mpv_ptr, video);
-                    current_video = video.clone();
-                }
-            }
-        }
-    });
-    Some(jh)
-}
-
-// --- Frame timing instrumentation ---
-
-struct FrameStats {
-    intervals_ms: Vec<f64>,
-    last_frame: Option<Instant>,
-    last_report: Instant,
-}
-
-impl FrameStats {
-    fn new() -> Self {
-        Self {
-            intervals_ms: Vec::with_capacity(2048),
-            last_frame: None,
-            last_report: Instant::now(),
-        }
-    }
-
-    fn record(&mut self, now: Instant) {
-        if let Some(prev) = self.last_frame {
-            let dt = now.duration_since(prev).as_secs_f64() * 1000.0;
-            self.intervals_ms.push(dt);
-        }
-        self.last_frame = Some(now);
-    }
-
-    fn should_report(&self) -> bool {
-        self.last_report.elapsed().as_secs() >= 5 && self.intervals_ms.len() >= 2
-    }
-
-    fn take_stats(&mut self) -> (f64, f64, f64, f64) {
-        let n = self.intervals_ms.len() as f64;
-        let sum: f64 = self.intervals_ms.iter().sum();
-        let avg = sum / n;
-        let min = self.intervals_ms.iter().cloned().reduce(f64::min).unwrap();
-        let max = self.intervals_ms.iter().cloned().reduce(f64::max).unwrap();
-        let variance: f64 =
-            self.intervals_ms.iter().map(|dt| (dt - avg).powi(2)).sum::<f64>() / n;
-        let jitter = variance.sqrt();
-
-        self.intervals_ms.clear();
-        self.last_report = Instant::now();
-
-        (avg, min, max, jitter)
-    }
 }
 
 // --- CLI ---
@@ -278,13 +109,38 @@ struct Cli {
     workspace: Vec<String>,
 
     /// Pass options to mpv as comma-separated key=value pairs. Bare flags are
-    /// set to "inf". Example: --mpv-options "input-ipc-server=/tmp/murale.sock,loop"
+    /// set to "yes" (loop is special-cased to loop-file=inf).
+    /// Example: --mpv-options "input-ipc-server=/tmp/murale.sock,hwdec=auto"
     #[arg(long, value_name = "OPTIONS")]
     mpv_options: Option<String>,
 
     /// Log frame timing and mpv playback stats every 5 seconds
     #[arg(long)]
     stats: bool,
+
+    /// Log wp_presentation scanout timestamps (per-frame, capped at 60s)
+    #[arg(long)]
+    scanout: bool,
+
+    /// Suppress internal periodic refresh (supervisor manages lifecycle)
+    #[arg(long)]
+    supervised: bool,
+}
+
+// --- Presentation timing (scanout instrumentation) ---
+
+struct PresentationMeta {
+    frame_count: u64,
+    media_pos: f64,
+    swap_mono_ns: u64,
+    is_held_release: bool,
+}
+
+// --- EGL lifecycle wrapper ---
+
+pub(crate) struct EglCore {
+    pub(crate) config: kegl::Config,
+    pub(crate) context: kegl::Context,
 }
 
 // --- Main state ---
@@ -301,13 +157,13 @@ struct Murale {
     layer: Option<LayerSurface>,
     target_output_name: Option<String>,
 
-    // EGL — display/config/context survive output reconnects and mpv refreshes.
-    // Only the per-surface EglState is recreated on reconnect.
+    // EGL display handle survives refreshes (same handle, re-initialized).
+    // EGL config/context are rebuilt on each refresh (wrapped in EglCore).
+    // Only the per-surface EglState is recreated on output reconnect.
     egl_instance: Arc<egl::EglInstance>,
     egl_state: Option<egl::EglState>,
     egl_display: kegl::Display,
-    egl_config: kegl::Config,
-    egl_context: kegl::Context,
+    egl_core: Option<EglCore>,
 
     // SAFETY: render_ctx MUST be declared before mpv — see transmute comment in init_mpv().
     render_ctx: Option<RenderContext<'static>>,
@@ -329,19 +185,44 @@ struct Murale {
     scale: u32,
     frame_callback_pending: bool,
     redraw_needed: bool,
-    frame_count: u64,
+
+    // Two-phase readiness for supervisor handoff
+    first_swap_done: bool,
+    ready_signaled: bool,
+
+    // Hidden sync: hold commit until released via SIGUSR2
+    hold_ready_signaled: bool,
+    hold_render_gen: u64,
+    target_render_armed: bool,
 
     // Periodic mpv refresh to counter residual GPU memory leak
     last_mpv_refresh: Instant,
+    refresh_pending: bool,
 
     // Instrumentation
     stats_enabled: bool,
+    scanout_enabled: bool,
+    scanout_start: Option<Instant>,
+    scanout_count: u64,
     frame_stats: FrameStats,
+    frame_count: u64,
+    last_mem_log: Instant,
+
+    // Loop restart detection via time-pos backward jump
+    loop_count: u64,
+    last_time_pos: f64,
 
     // Control
+    supervised: bool,
     exit: bool,
     video_path: String,
     mpv_options: Option<String>,
+
+    // Workspace config — kept for intent replay during refresh
+    workspace_config: Option<(HashMap<String, String>, String)>,
+
+    // Scanout instrumentation (wp_presentation)
+    presentation: Option<wp_presentation::WpPresentation>,
 
     // Raw wl_display pointer for mpv
     wl_display_ptr: *mut c_void,
@@ -369,16 +250,27 @@ impl Murale {
     }
 
     fn teardown_surface(&mut self) {
-        self.egl_state.take();
+        if let Some(state) = self.egl_state.take() {
+            if let Err(e) = state.destroy(&self.egl_instance, self.egl_display) {
+                tracing::warn!("EGL surface teardown error: {e}");
+            }
+        }
         self.layer.take();
         self.frame_callback_pending = false;
         self.redraw_needed = false;
-        tracing::info!("surface torn down (output lost)");
+        if let Some(mpv) = &self.mpv {
+            let _ = mpv.set_property("pause", true);
+        }
+        tracing::info!("surface torn down, playback paused");
     }
 
     fn render_frame(&mut self) {
         let egl_state = match &self.egl_state {
             Some(s) => s,
+            None => return,
+        };
+        let core = match &self.egl_core {
+            Some(c) => c,
             None => return,
         };
         let render_ctx = match &self.render_ctx {
@@ -394,12 +286,13 @@ impl Murale {
         let h = (self.height * self.scale) as i32;
 
         if let Err(e) = self.egl_instance.make_current(
-            egl_state.display,
+            self.egl_display,
             Some(egl_state.surface),
             Some(egl_state.surface),
-            Some(egl_state.context),
+            Some(core.context),
         ) {
             tracing::error!("eglMakeCurrent failed: {e:?}");
+            self.redraw_needed = true;
             return;
         }
 
@@ -411,10 +304,21 @@ impl Murale {
         let err = render_nonblocking(render_ctx.ctx, w, h);
         if err < 0 {
             tracing::error!("mpv render failed: {err}");
+            self.redraw_needed = true;
             return;
         }
 
-        self.frame_count += 1;
+        if COMMIT_HELD.load(Ordering::Relaxed) {
+            self.hold_render_gen += 1;
+            self.frame_count += 1;
+            self.target_render_armed = false;
+
+            if !self.hold_ready_signaled {
+                self.signal_hold_ready();
+            }
+            self.write_target_rendered();
+            return;
+        }
 
         if self.stats_enabled {
             self.frame_stats.record(Instant::now());
@@ -424,20 +328,45 @@ impl Murale {
             }
         }
 
+        let media_pos = if self.scanout_enabled && self.presentation.is_some() {
+            self.mpv
+                .as_ref()
+                .and_then(|m| m.get_property::<f64>("time-pos").ok())
+                .unwrap_or(-1.0)
+        } else {
+            -1.0
+        };
+
         layer
             .wl_surface()
             .frame(&self.qh, layer.wl_surface().clone());
         self.frame_callback_pending = true;
         self.redraw_needed = false;
 
-        if let Err(e) = self.egl_instance.swap_buffers(egl_state.display, egl_state.surface) {
+        if let Err(e) = self
+            .egl_instance
+            .swap_buffers(self.egl_display, egl_state.surface)
+        {
             tracing::error!("eglSwapBuffers failed: {e:?}");
             self.frame_callback_pending = false;
+            self.redraw_needed = true;
             return;
         }
 
         unsafe {
             libmpv2_sys::mpv_render_context_report_swap(render_ctx.ctx);
+        }
+
+        if !self.first_swap_done {
+            self.first_swap_done = true;
+        }
+
+        self.frame_count += 1;
+        if self.stats_enabled && self.frame_count.is_multiple_of(1000) {
+            mem::log_rss(&format!("frame#{}", self.frame_count));
+        }
+        if self.scanout_enabled {
+            self.request_presentation_feedback(media_pos, false);
         }
     }
 
@@ -453,6 +382,19 @@ impl Murale {
         let vsync_ratio: f64 = mpv.get_property("vsync-ratio").unwrap_or(0.0);
         tracing::info!(
             "[stats] fps={fps:.1} delayed={delayed} vo_drops={vo_drops} dec_drops={dec_drops} vsync_ratio={vsync_ratio:.2} | interval avg={avg:.2}ms min={min:.2}ms max={max:.2}ms jitter={jitter:.2}ms"
+        );
+
+        mem::log_rss("stats-interval");
+
+        let cache_dur: f64 = mpv.get_property("demuxer-cache-duration").unwrap_or(-1.0);
+        let vp_w: i64 = mpv.get_property("video-out-params/w").unwrap_or(-1);
+        let vp_h: i64 = mpv.get_property("video-out-params/h").unwrap_or(-1);
+        let vp_fmt: String = mpv
+            .get_property("video-out-params/pixelformat")
+            .unwrap_or_default();
+        let elapsed = mem::elapsed_secs();
+        tracing::info!(
+            "[mpv-props] cache_dur={cache_dur:.1}s vout={vp_w}x{vp_h} pixfmt={vp_fmt} elapsed={elapsed:.0}s"
         );
     }
 
@@ -473,121 +415,205 @@ impl Murale {
         };
 
         if flags & libmpv2::render::mpv_render_update::Frame != 0 {
+            if COMMIT_HELD.load(Ordering::Relaxed) {
+                if !self.target_render_armed {
+                    if self.hold_render_gen == 0 {
+                        self.target_render_armed = true;
+                    } else {
+                        self.check_arm_file();
+                    }
+                }
+                if self.target_render_armed {
+                    self.render_frame();
+                }
+                return;
+            }
             if self.frame_callback_pending {
                 self.redraw_needed = true;
             } else {
                 self.render_frame();
             }
         }
-    }
 
-    fn init_mpv(&mut self) -> Result<()> {
-        let mpv = Mpv::new()?;
-
-        mpv.set_property("vo", "libmpv")?;
-        mpv.set_property("hwdec", "auto")?;
-        mpv.set_property("video-sync", "display-resample")?;
-        mpv.set_property("loop-file", "inf")?;
-        mpv.set_property("keepaspect", true)?;
-        mpv.set_property("panscan", 1.0f64)?;
-        mpv.set_property("background-color", "#00000000")?;
-        mpv.set_property("terminal", "no")?;
-
-        if let Some(opts) = &self.mpv_options {
-            for (key, value) in parse_mpv_options(opts) {
-                if let Err(e) = mpv.set_property(key, value) {
-                    tracing::warn!("failed to set mpv option {key}={value}: {e}");
+        // Detect loop restarts via time-pos backward jump.
+        // loop-file=inf seeks to start without firing END_FILE.
+        if let Some(mpv) = &self.mpv {
+            if let Ok(pos) = mpv.get_property::<f64>("time-pos") {
+                if self.last_time_pos > 5.0 && pos < self.last_time_pos * 0.2 {
+                    self.loop_count += 1;
+                    let (rss, swap) = mem::read_rss_raw();
+                    let total = rss + swap;
+                    let elapsed = mem::elapsed_secs();
+                    tracing::info!(
+                        "[mem] loop#{} rss={rss:.1}MB swap={swap:.1}MB total={total:.1}MB elapsed={elapsed:.0}s",
+                        self.loop_count
+                    );
                 }
+                self.last_time_pos = pos;
             }
         }
-
-        let init_params = OpenGLInitParams {
-            get_proc_address: egl::mpv_get_proc_address,
-            ctx: self.egl_instance.clone(),
-        };
-
-        let render_params = [
-            RenderParam::ApiType(RenderParamApiType::OpenGl),
-            RenderParam::InitParams(init_params),
-            RenderParam::WaylandDisplay(self.wl_display_ptr),
-        ];
-
-        let mut render_ctx = mpv.create_render_context(render_params)?;
-
-        let wakeup_fd_raw = self.wakeup_fd.as_raw_fd();
-        render_ctx.set_update_callback(move || {
-            let buf = 1u64.to_ne_bytes();
-            let _ = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(wakeup_fd_raw) }, &buf);
-        });
-
-        mpv.command("loadfile", &[&self.video_path])?;
-
-        // SAFETY: RenderContext<'a> borrows Mpv, but we need both in the same struct.
-        // This transmute erases the lifetime to 'static. It is sound because:
-        //   1. render_ctx is declared BEFORE mpv in the struct
-        //   2. Rust drops fields in declaration order (top to bottom)
-        //   3. Therefore render_ctx always drops before mpv
-        //   4. Murale is never moved after init_mpv (lives on the stack in run())
-        //   5. RenderContext internally holds a raw *mut mpv_render_context (C pointer),
-        //      not a Rust &Mpv reference — the PhantomData lifetime is purely a
-        //      borrow-checker hint to enforce drop ordering, which we handle manually
-        // DO NOT reorder the render_ctx/mpv fields without updating this invariant.
-        let render_ctx: RenderContext<'static> = unsafe { std::mem::transmute(render_ctx) };
-
-        if let Ok(mut guard) = self.mpv_ptr.lock() {
-            guard.0 = mpv.ctx.as_ptr();
-        }
-
-        self.render_ctx = Some(render_ctx);
-        self.mpv = Some(mpv);
-        self.last_mpv_refresh = Instant::now();
-
-        tracing::info!("playing {}", self.video_path);
-        Ok(())
     }
 
-    fn refresh_mpv(&mut self) {
-        let (path, time_pos) = match &self.mpv {
-            Some(mpv) => {
-                let path: String = mpv
-                    .get_property("path")
-                    .unwrap_or_else(|_| self.video_path.clone());
-                let pos: f64 = mpv.get_property("time-pos").unwrap_or(0.0);
-                (path, pos)
+    fn signal_hold_ready(&mut self) {
+        if let Ok(path) = std::env::var("MURALE_HOLD_READY_FILE") {
+            let gen = std::env::var("MURALE_GENERATION").unwrap_or_default();
+            let content = format!("HOLD_READY:{}:{}", std::process::id(), gen);
+            match std::fs::write(&path, &content) {
+                Ok(()) => {
+                    tracing::info!("hold readiness signaled: {path}");
+                    self.hold_ready_signaled = true;
+                }
+                Err(e) => tracing::error!("failed to write hold ready: {e}"),
             }
+        } else {
+            self.hold_ready_signaled = true;
+        }
+    }
+
+    fn write_target_rendered(&self) {
+        if let Ok(path) = std::env::var("MURALE_TARGET_RENDERED_FILE") {
+            let pos = self
+                .mpv
+                .as_ref()
+                .and_then(|m| m.get_property::<f64>("time-pos").ok())
+                .unwrap_or(-1.0);
+            let content = format!("{}:{:.6}", self.hold_render_gen, pos);
+            if let Err(e) = std::fs::write(&path, &content) {
+                tracing::error!("failed to write target rendered: {e}");
+            }
+        }
+    }
+
+    fn check_arm_file(&mut self) {
+        let Ok(path) = std::env::var("MURALE_ARM_RENDER_FILE") else {
+            return;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Some((target_str, _seq)) = content.trim().split_once(':') else {
+            return;
+        };
+        let Ok(expected) = target_str.parse::<f64>() else {
+            return;
+        };
+        let Some(mpv) = &self.mpv else { return };
+        let Ok(pos) = mpv.get_property::<f64>("time-pos") else {
+            return;
+        };
+        let frame_time = 1.0 / 240.0;
+        if (pos - expected).abs() < frame_time {
+            let _ = std::fs::remove_file(&path);
+            self.target_render_armed = true;
+        }
+    }
+
+    fn present_held_frame(&mut self) {
+        let egl_state = match &self.egl_state {
+            Some(s) => s,
+            None => return,
+        };
+        let render_ctx = match &self.render_ctx {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let layer = match &self.layer {
+            Some(l) => l,
+            None => return,
+        };
+        let core = match &self.egl_core {
+            Some(c) => c,
             None => return,
         };
 
-        tracing::info!("refreshing mpv context (periodic leak mitigation)");
-
-        // Lock the mutex and null the pointer — any in-flight workspace
-        // mpv_command will see null and return. The lock ensures no call
-        // is in progress when we drop.
-        if let Ok(mut guard) = self.mpv_ptr.lock() {
-            guard.0 = std::ptr::null_mut();
-        }
-
-        // Drop in order: render_ctx first, then mpv
-        self.render_ctx.take();
-        self.mpv.take();
-
-        if let Err(e) = self.init_mpv() {
-            tracing::error!("mpv refresh failed: {e}");
-            SHUTDOWN.store(true, Ordering::Relaxed);
-            self.exit = true;
+        if let Err(e) = self.egl_instance.make_current(
+            self.egl_display,
+            Some(egl_state.surface),
+            Some(egl_state.surface),
+            Some(core.context),
+        ) {
+            tracing::error!("held make_current failed: {e:?}");
             return;
         }
 
-        // Seek to the saved position
-        if let Some(mpv) = &self.mpv {
-            if path != self.video_path {
-                let _ = mpv.command("loadfile", &[&path]);
-            }
-            if time_pos > 1.0 {
-                let pos_str = format!("{time_pos:.1}");
-                let _ = mpv.command("seek", &[&pos_str, "absolute"]);
-            }
+        layer
+            .wl_surface()
+            .frame(&self.qh, layer.wl_surface().clone());
+        self.frame_callback_pending = true;
+
+        if let Err(e) = self
+            .egl_instance
+            .swap_buffers(self.egl_display, egl_state.surface)
+        {
+            tracing::error!("held swap failed: {e:?}");
+            self.frame_callback_pending = false;
+            return;
         }
+
+        unsafe {
+            libmpv2_sys::mpv_render_context_report_swap(render_ctx.ctx);
+        }
+
+        if !self.first_swap_done {
+            self.first_swap_done = true;
+        }
+        self.frame_count += 1;
+
+        if self.scanout_enabled {
+            let held_pos = self
+                .mpv
+                .as_ref()
+                .and_then(|m| m.get_property::<f64>("time-pos").ok())
+                .unwrap_or(-1.0);
+            self.request_presentation_feedback(held_pos, true);
+        }
+
+        if let Ok(path) = std::env::var("MURALE_SWAP_DONE_FILE") {
+            let gen = std::env::var("MURALE_GENERATION").unwrap_or_default();
+            let content = format!("{}:{}", std::process::id(), gen);
+            let _ = std::fs::write(&path, &content);
+        }
+
+        tracing::info!("held frame presented (swap done)");
+    }
+
+    fn request_presentation_feedback(&mut self, media_pos: f64, is_held_release: bool) {
+        if !self.scanout_enabled {
+            return;
+        }
+        let start = *self.scanout_start.get_or_insert_with(Instant::now);
+        if start.elapsed() >= Duration::from_secs(60) {
+            tracing::info!(
+                "[scanout] capped after 60s ({} frames logged), stopping",
+                self.scanout_count
+            );
+            self.scanout_enabled = false;
+            return;
+        }
+        self.scanout_count += 1;
+        let presentation = match &self.presentation {
+            Some(p) => p,
+            None => return,
+        };
+        let layer = match &self.layer {
+            Some(l) => l,
+            None => return,
+        };
+        let swap_mono_ns = {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+            ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+        };
+        let meta = PresentationMeta {
+            frame_count: self.frame_count,
+            media_pos,
+            swap_mono_ns,
+            is_held_release,
+        };
+        let _ = presentation.feedback(layer.wl_surface(), &self.qh, meta);
     }
 
     fn find_target_output(&self, name: &str) -> Option<wl_output::WlOutput> {
@@ -614,6 +640,12 @@ impl CompositorHandler for Murale {
     ) {
         self.scale = new_factor as u32;
         tracing::debug!("scale factor changed to {new_factor}");
+        if let Some(egl_state) = &self.egl_state {
+            let scaled_w = (self.width * self.scale) as i32;
+            let scaled_h = (self.height * self.scale) as i32;
+            egl_state.egl_window.resize(scaled_w, scaled_h, 0, 0);
+            self.redraw_needed = true;
+        }
     }
 
     fn transform_changed(
@@ -633,6 +665,37 @@ impl CompositorHandler for Murale {
         _time: u32,
     ) {
         self.frame_callback_pending = false;
+
+        // VSync-aligned release: send SIGUSR2 to B from A's frame callback.
+        // One-shot — read PID from file, signal, delete file.
+        if let Ok(path) = std::env::var("MURALE_RELEASE_TARGET_FILE") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(pid) = content.trim().parse::<i32>() {
+                    unsafe { libc::kill(pid, libc::SIGUSR2) };
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+
+        if self.first_swap_done && !self.ready_signaled {
+            if let Ok(path) = std::env::var("MURALE_READY_FILE") {
+                let content = format!(
+                    "{}:{}",
+                    std::process::id(),
+                    std::env::var("MURALE_GENERATION").unwrap_or_default()
+                );
+                match std::fs::write(&path, &content) {
+                    Ok(()) => {
+                        tracing::info!("readiness signaled: {path}");
+                        self.ready_signaled = true;
+                    }
+                    Err(e) => tracing::error!("failed to write ready file: {e}"),
+                }
+            } else {
+                self.ready_signaled = true;
+            }
+        }
+
         if self.redraw_needed {
             self.render_frame();
         }
@@ -685,10 +748,7 @@ impl OutputHandler for Murale {
             None => return,
         };
 
-        let name = self
-            .output_state
-            .info(&output)
-            .and_then(|i| i.name.clone());
+        let name = self.output_state.info(&output).and_then(|i| i.name.clone());
 
         if name.as_deref() == Some(&target) && self.initialized && self.layer.is_none() {
             tracing::info!("output {target} reconnected, recreating surface");
@@ -721,10 +781,7 @@ impl OutputHandler for Murale {
             None => return,
         };
 
-        let name = self
-            .output_state
-            .info(&output)
-            .and_then(|i| i.name.clone());
+        let name = self.output_state.info(&output).and_then(|i| i.name.clone());
 
         if name.as_deref() == Some(target.as_str()) {
             tracing::info!("output {target} disconnected");
@@ -769,11 +826,20 @@ impl LayerShellHandler for Murale {
                 None => return,
             };
 
+            let core = match &self.egl_core {
+                Some(c) => c,
+                None => {
+                    tracing::error!("no EGL core during configure");
+                    self.exit = true;
+                    return;
+                }
+            };
+
             match egl::create_surface(
                 &self.egl_instance,
                 self.egl_display,
-                self.egl_config,
-                self.egl_context,
+                core.config,
+                core.context,
                 layer.wl_surface(),
                 scaled_w,
                 scaled_h,
@@ -792,11 +858,25 @@ impl LayerShellHandler for Murale {
                     self.exit = true;
                     return;
                 }
+                self.publish_mpv_handle();
             } else {
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.set_property("pause", false);
+                }
                 tracing::info!("surface recreated, resuming playback");
             }
 
             self.initialized = true;
+
+            // R2-B4: if a deferred refresh is pending, run it now and return.
+            // refresh_mpv handles its own kick-start rendering, so we must NOT
+            // fall through to the render_frame() call below.
+            if self.refresh_pending {
+                self.refresh_pending = false;
+                self.refresh_mpv();
+                return;
+            }
+
             self.render_frame();
         } else if let Some(egl_state) = &self.egl_state {
             let scaled_w = (w * self.scale) as i32;
@@ -811,6 +891,62 @@ delegate_output!(Murale);
 delegate_layer!(Murale);
 delegate_registry!(Murale);
 
+impl Dispatch<wp_presentation::WpPresentation, ()> for Murale {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_presentation::WpPresentation,
+        event: wp_presentation::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            tracing::debug!("wp_presentation clock_id: {clk_id}");
+        }
+    }
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, PresentationMeta> for Murale {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        data: &PresentationMeta,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                refresh: _,
+                seq_hi,
+                seq_lo,
+                flags: _,
+            } => {
+                let scanout_ns =
+                    ((tv_sec_hi as u64) << 32 | tv_sec_lo as u64) * 1_000_000_000 + tv_nsec as u64;
+                let seq = (seq_hi as u64) << 32 | seq_lo as u64;
+                let submit_us = scanout_ns.saturating_sub(data.swap_mono_ns) / 1000;
+                tracing::info!(
+                    "[scanout] frame={} pos={:.6} scanout_ns={} submit_to_scanout={}us seq={} held={}",
+                    data.frame_count, data.media_pos, scanout_ns, submit_us, seq, data.is_held_release
+                );
+            }
+            wp_presentation_feedback::Event::Discarded => {
+                tracing::warn!(
+                    "[scanout] DISCARDED frame={} pos={:.6} held={}",
+                    data.frame_count,
+                    data.media_pos,
+                    data.is_held_release
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 impl ProvidesRegistryState for Murale {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -820,6 +956,8 @@ impl ProvidesRegistryState for Murale {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    mem::init();
+    mem::log_rss("startup");
 
     let workspace_map: HashMap<String, String> = cli
         .workspace
@@ -830,30 +968,61 @@ fn run() -> Result<()> {
         })
         .collect();
 
+    let workspace_config = if workspace_map.is_empty() {
+        None
+    } else {
+        Some((workspace_map, cli.video.clone()))
+    };
+
     unsafe {
-        libc::signal(libc::SIGINT, handle_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handle_signal as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGUSR1,
+            handle_refresh_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGUSR2,
+            handle_release_signal as *const () as libc::sighandler_t,
+        );
     }
 
-    let conn = Connection::connect_to_env().context(
-        "could not connect to Wayland compositor (is a Wayland session running?)",
-    )?;
+    if std::env::var("MURALE_HOLD_COMMIT").is_ok() {
+        COMMIT_HELD.store(true, Ordering::Relaxed);
+        tracing::info!("hold-commit mode active");
+    }
+
+    let conn = Connection::connect_to_env()
+        .context("could not connect to Wayland compositor (is a Wayland session running?)")?;
     let (globals, mut event_queue) = registry_queue_init(&conn)
         .map_err(|e| anyhow::anyhow!("Wayland registry init failed: {e}"))?;
     let qh = event_queue.handle();
 
     let compositor_state = CompositorState::bind(&globals, &qh)
         .context("compositor does not support wl_compositor")?;
-    let layer_shell = LayerShell::bind(&globals, &qh).context(
-        "compositor does not support wlr-layer-shell (required for wallpaper surfaces)",
-    )?;
+    let layer_shell = LayerShell::bind(&globals, &qh)
+        .context("compositor does not support wlr-layer-shell (required for wallpaper surfaces)")?;
     let output_state = OutputState::new(&globals, &qh);
+
+    let presentation: Option<wp_presentation::WpPresentation> = if cli.scanout {
+        globals
+            .bind::<wp_presentation::WpPresentation, _, _>(&qh, 1..=1, ())
+            .map_err(|e| tracing::debug!("wp_presentation not available: {e}"))
+            .ok()
+    } else {
+        None
+    };
 
     let wl_display_ptr = conn.backend().display_ptr() as *mut c_void;
 
     let egl_instance = egl::load_egl()?;
-    let (egl_display, egl_config, egl_context) =
-        egl::init_display(&egl_instance, wl_display_ptr)?;
+    let (egl_display, egl_config, egl_context) = egl::init_display(&egl_instance, wl_display_ptr)?;
 
     let wakeup_fd = EventFd::from_flags(
         EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_SEMAPHORE,
@@ -872,8 +1041,10 @@ fn run() -> Result<()> {
         egl_instance,
         egl_state: None,
         egl_display,
-        egl_config,
-        egl_context,
+        egl_core: Some(EglCore {
+            config: egl_config,
+            context: egl_context,
+        }),
         render_ctx: None,
         mpv: None,
         mpv_ptr: mpv_ptr.clone(),
@@ -885,13 +1056,28 @@ fn run() -> Result<()> {
         scale: 1,
         frame_callback_pending: false,
         redraw_needed: false,
-        frame_count: 0,
+        first_swap_done: false,
+        ready_signaled: false,
+        hold_ready_signaled: false,
+        hold_render_gen: 0,
+        target_render_armed: false,
         last_mpv_refresh: Instant::now(),
+        refresh_pending: false,
         stats_enabled: cli.stats,
+        scanout_enabled: cli.scanout,
+        scanout_start: None,
+        scanout_count: 0,
         frame_stats: FrameStats::new(),
+        frame_count: 0,
+        loop_count: 0,
+        last_time_pos: 0.0,
+        last_mem_log: Instant::now(),
+        supervised: cli.supervised,
         exit: false,
         video_path: cli.video.clone(),
         mpv_options: cli.mpv_options,
+        workspace_config,
+        presentation,
         wl_display_ptr,
     };
 
@@ -917,12 +1103,6 @@ fn run() -> Result<()> {
 
     state.create_layer_surface(target_output.as_ref());
 
-    let workspace_map_for_thread = if workspace_map.is_empty() {
-        None
-    } else {
-        Some((workspace_map, cli.video))
-    };
-
     let wl_fd = conn.as_fd();
     tracing::debug!("entering main loop");
 
@@ -934,8 +1114,22 @@ fn run() -> Result<()> {
             break;
         }
 
-        // Periodic mpv context refresh to counter residual GPU memory leak
-        if state.mpv.is_some() && state.last_mpv_refresh.elapsed() >= MPV_REFRESH_INTERVAL {
+        // SIGUSR2: release held frame (swap without re-render)
+        if RELEASE_SIGNAL.swap(false, Ordering::Relaxed) && COMMIT_HELD.load(Ordering::Relaxed) {
+            COMMIT_HELD.store(false, Ordering::Relaxed);
+            tracing::info!("hold released");
+            state.present_held_frame();
+        }
+
+        // SIGUSR1: trigger immediate refresh (coalesced, shutdown wins)
+        if REFRESH_REQUESTED.swap(false, Ordering::Relaxed) && state.mpv.is_some() {
+            state.refresh_mpv();
+        }
+
+        if state.mpv.is_some()
+            && !state.supervised
+            && state.last_mpv_refresh.elapsed() >= MPV_REFRESH_INTERVAL
+        {
             state.refresh_mpv();
         }
 
@@ -945,26 +1139,23 @@ fn run() -> Result<()> {
             let read_guard = event_queue.prepare_read();
             conn.flush()?;
 
-            match read_guard {
-                Some(guard) => {
-                    let mut pollfds = [
-                        PollFd::new(wl_fd, PollFlags::POLLIN),
-                        PollFd::new(state.wakeup_fd.as_fd(), PollFlags::POLLIN),
-                    ];
+            if let Some(guard) = read_guard {
+                let mut pollfds = [
+                    PollFd::new(wl_fd, PollFlags::POLLIN),
+                    PollFd::new(state.wakeup_fd.as_fd(), PollFlags::POLLIN),
+                ];
 
-                    match nix::poll::poll(&mut pollfds, PollTimeout::from(16u16)) {
-                        Ok(_) => {}
-                        Err(nix::errno::Errno::EINTR) => continue,
-                        Err(e) => return Err(anyhow::anyhow!("poll failed: {e}")),
-                    }
-
-                    if pollfds[0].any().unwrap_or(false) {
-                        guard.read()?;
-                    }
-
-                    mpv_ready = pollfds[1].any().unwrap_or(false);
+                match nix::poll::poll(&mut pollfds, PollTimeout::from(16u16)) {
+                    Ok(_) => {}
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(e) => return Err(anyhow::anyhow!("poll failed: {e}")),
                 }
-                None => {}
+
+                if pollfds[0].any().unwrap_or(false) {
+                    guard.read()?;
+                }
+
+                mpv_ready = pollfds[1].any().unwrap_or(false);
             }
         }
 
@@ -974,19 +1165,21 @@ fn run() -> Result<()> {
 
         event_queue.dispatch_pending(&mut state)?;
 
+        if state.last_mem_log.elapsed().as_secs() >= 30 {
+            mem::log_rss("periodic");
+            state.last_mem_log = Instant::now();
+        }
+
         if mpv_ready {
             state.handle_mpv_wakeup();
         }
 
         if workspace_join_handle.is_none() {
             if let (Some(_), Some((ref map, ref default_video))) =
-                (&state.mpv, &workspace_map_for_thread)
+                (&state.mpv, &state.workspace_config)
             {
-                workspace_join_handle = spawn_workspace_listener(
-                    mpv_ptr.clone(),
-                    map.clone(),
-                    default_video.clone(),
-                );
+                workspace_join_handle =
+                    spawn_workspace_listener(mpv_ptr.clone(), map.clone(), default_video.clone());
             }
         }
 
@@ -996,13 +1189,46 @@ fn run() -> Result<()> {
     }
 
     tracing::info!("shutting down");
+    mem::log_rss("shutdown-start");
+    mem::log_extra("shutdown-start");
     if let Some(jh) = workspace_join_handle {
         let _ = jh.join();
     }
+    // Attach null buffer so compositor sees empty surface before destruction —
+    // prevents tear/flash when B is rendered on top during overlap handoff.
+    if let Some(ref layer) = state.layer {
+        layer.wl_surface().attach(None, 0, 0);
+        layer.wl_surface().commit();
+        let _ = conn.flush();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // GL context must be current for mpv's render teardown (glDelete* calls)
+    if let Some(ref egl_state) = state.egl_state {
+        if let Some(ref core) = state.egl_core {
+            let _ = state.egl_instance.make_current(
+                state.egl_display,
+                Some(egl_state.surface),
+                Some(egl_state.surface),
+                Some(core.context),
+            );
+        }
+    }
+    mem::log_rss("shutdown-before-render_ctx-drop");
     state.render_ctx.take();
-    state.mpv.take();
-    state.egl_state.take();
-    let _ = state.egl_instance.destroy_context(state.egl_display, state.egl_context);
+    mem::log_rss("shutdown-after-render_ctx-drop");
+    if let Some(mpv) = state.mpv.take() {
+        mpv.terminate_destroy();
+    }
+    mem::log_rss("shutdown-after-mpv-drop");
+    if let Some(egl_state) = state.egl_state.take() {
+        let _ = egl_state.destroy(&state.egl_instance, state.egl_display);
+    }
+    if let Some(core) = state.egl_core.take() {
+        let _ = state
+            .egl_instance
+            .destroy_context(state.egl_display, core.context);
+    }
     let _ = state.egl_instance.terminate(state.egl_display);
 
     Ok(())
