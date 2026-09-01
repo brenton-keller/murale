@@ -74,7 +74,7 @@ pub(crate) fn render_nonblocking(ctx: *mut libmpv2_sys::mpv_render_context, w: i
     unsafe { libmpv2_sys::mpv_render_context_render(ctx, params.as_mut_ptr()) }
 }
 
-const PRE_INIT_OPTIONS: &[&str] = &["profile", "config", "config-dir"];
+const PRE_INIT_OPTIONS: &[&str] = &["config", "config-dir"];
 
 impl Murale {
     pub(crate) fn init_mpv(&mut self) -> Result<()> {
@@ -112,10 +112,22 @@ impl Murale {
             if PRE_INIT_OPTIONS.contains(&key.as_str()) {
                 continue;
             }
+            if key == "profile" {
+                mpv.command("apply-profile", &[value.as_str()]).map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to apply mpv profile '{value}': {e}; \
+                         check the name, and for a user-defined profile pass \
+                         config=yes (plus config-dir=... when non-default)"
+                    )
+                })?;
+                continue;
+            }
             if let Err(e) = mpv.set_property(key.as_str(), value.as_str()) {
                 tracing::warn!("failed to set mpv option {key}={value}: {e}");
             }
         }
+
+        mpv.set_property("vo", "libmpv")?;
 
         let init_params = OpenGLInitParams {
             get_proc_address: egl::mpv_get_proc_address,

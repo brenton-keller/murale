@@ -15,8 +15,8 @@ murale fixes all of this in ~2,000 lines of Rust:
 | | murale | mpvpaper |
 |---|---|---|
 | **Memory (4K HEVC, 7680x2160)** | **~530 MB per generation** | 7.6 GB and growing |
-| **Memory leak** | Bounded by supervisor | [Yes](https://github.com/GhostNaN/mpvpaper/issues/117) |
-| **Processes** | 1 (+ optional supervisor) | 2 (mpvpaper + mpvpaper-holder) |
+| **Memory leak** | Bounded by automatic process recycling | [Yes](https://github.com/GhostNaN/mpvpaper/issues/117) |
+| **Processes** | 1 binary (self-recycling) | 2 (mpvpaper + mpvpaper-holder) |
 | **Frame pacing (240Hz)** | 0 delayed frames | Smooth but leaking |
 | **Language** | Rust | C |
 | **Crash on monitor disconnect** | No | [Yes](https://github.com/GhostNaN/mpvpaper/issues/97) |
@@ -26,7 +26,7 @@ murale fixes all of this in ~2,000 lines of Rust:
 - **Wayland native** -- uses `wlr-layer-shell` for proper wallpaper surfaces
 - **Hardware decode** -- `hwdec=auto` for GPU-accelerated video decode (NVDEC, VAAPI)
 - **Per-workspace videos** -- different wallpapers per Hyprland workspace via `--workspace`
-- **Dual-process supervisor** -- `murale-supervisor` recycles the process every 2h with a seamless handoff, bounding memory permanently
+- **Self-recycling** -- automatically recycles the renderer every 2h with a seamless dual-process handoff, bounding NVIDIA EGL memory permanently
 - **mpv IPC** -- full mpv command interface via `input-ipc-server` socket
 - **Frame-perfect pacing** -- non-blocking render with compositor frame callback synchronization
 - **Minimal output** -- two log lines by default, detailed stats with `--stats`
@@ -104,22 +104,22 @@ murale ~/Videos/default.mp4 \
 
 The default video plays on unmapped workspaces. Switching workspaces changes the wallpaper instantly via mpv's `loadfile`.
 
-### Supervisor (recommended for long sessions)
+### Self-recycling (default)
 
-NVIDIA's EGL driver accumulates ~165 MB/hour of internal state that can only be freed by destroying the process. `murale-supervisor` handles this automatically with a seamless dual-process handoff every 2 hours:
+NVIDIA's EGL driver accumulates ~165 MB/hour of internal state that can only be freed by destroying the process. murale handles this automatically: it runs a lightweight supervisor that spawns renderer children, and every 2 hours launches a fresh renderer synced to the current video position, then retires the old one — no visible interruption. Each generation starts at ~530 MB with zero accumulation across handoffs.
+
+This is the default behavior. No extra scripts or configuration needed.
+
+To adjust the recycle interval (in seconds):
 
 ```bash
-murale-supervisor ~/Videos/wallpaper.mp4 --output DP-2 --stats \
-  --workspace 1=~/Videos/ws1.mp4 \
-  --mpv-options "hwdec=auto"
+MURALE_REFRESH_INTERVAL=3600 murale ~/Videos/wallpaper.mp4  # recycle every 1h
 ```
 
-The supervisor launches a fresh murale, syncs it to the current video position, and retires the old process — no visible interruption. Each generation starts at ~530 MB with zero accumulation across handoffs.
-
-Set `MURALE_BIN` if the murale binary isn't on your PATH:
+To disable recycling entirely and run as a single process:
 
 ```bash
-MURALE_BIN=./target/release/murale murale-supervisor ~/Videos/wallpaper.mp4
+murale --no-recycle ~/Videos/wallpaper.mp4
 ```
 
 ### mpv options

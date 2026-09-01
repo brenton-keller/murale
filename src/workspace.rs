@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::mpv::{mpv_loadfile, SharedMpvPtr};
@@ -22,6 +23,8 @@ pub(crate) fn spawn_workspace_listener(
     mpv_ptr: SharedMpvPtr,
     workspace_map: HashMap<String, String>,
     default_video: String,
+    hold_active: Arc<AtomicBool>,
+    deferred_video: Arc<Mutex<Option<String>>>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let sig = match std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
         Ok(s) => s,
@@ -37,11 +40,13 @@ pub(crate) fn spawn_workspace_listener(
     let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
     let socket_path = format!("{xdg}/hypr/{sig}/.socket2.sock");
 
-    if let Some(active) = get_active_workspace() {
-        if let Some(video) = workspace_map.get(&active) {
-            if *video != default_video {
-                tracing::info!("workspace {active}: loading {video}");
-                mpv_loadfile(&mpv_ptr, video);
+    if !hold_active.load(Ordering::Relaxed) {
+        if let Some(active) = get_active_workspace() {
+            if let Some(video) = workspace_map.get(&active) {
+                if *video != default_video {
+                    tracing::info!("workspace {active}: loading {video}");
+                    mpv_loadfile(&mpv_ptr, video);
+                }
             }
         }
     }
@@ -95,9 +100,15 @@ pub(crate) fn spawn_workspace_listener(
                 let video = workspace_map.get(name).unwrap_or(&default_video);
 
                 if *video != current_video {
-                    tracing::info!("workspace {name}: loading {video}");
-                    if mpv_loadfile(&mpv_ptr, video) {
-                        current_video = video.clone();
+                    if hold_active.load(Ordering::Relaxed) {
+                        tracing::debug!("workspace {name}: deferred (hold mode)");
+                        let mut def = deferred_video.lock().unwrap_or_else(|e| e.into_inner());
+                        *def = Some(video.clone());
+                    } else {
+                        tracing::info!("workspace {name}: loading {video}");
+                        if mpv_loadfile(&mpv_ptr, video) {
+                            current_video = video.clone();
+                        }
                     }
                 }
             }
