@@ -61,6 +61,20 @@ enum WaitResult {
     Message(ChildMsg),
 }
 
+pub(crate) fn output_namespace(output: Option<&str>) -> String {
+    match output {
+        None => "default".to_string(),
+        Some(name) => {
+            assert!(
+                !name.is_empty() && name.len() <= 100,
+                "invalid output name: must be 1-100 bytes"
+            );
+            let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+            format!("out-{hex}")
+        }
+    }
+}
+
 // ==================== Entry point ====================
 
 pub fn run_supervisor(cli: Cli) -> Result<()> {
@@ -77,7 +91,8 @@ pub fn run_supervisor(cli: Cli) -> Result<()> {
     }
 
     let xdg = std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR must be set")?;
-    let ready_dir = PathBuf::from(&xdg).join("murale");
+    let ns = output_namespace(cli.output.as_deref());
+    let ready_dir = PathBuf::from(&xdg).join("murale").join(&ns);
     fs::create_dir_all(&ready_dir)?;
 
     let log_dir = ready_dir.join("logs");

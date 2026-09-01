@@ -1583,8 +1583,18 @@ fn main() {
         .unwrap_or_else(|_| "murale=info".parse().unwrap());
 
     if is_supervisor {
+        let cli = Cli::parse();
+
+        if let Some(ref name) = cli.output {
+            if name.is_empty() || name.len() > 100 {
+                eprintln!("error: invalid --output value: must be 1-100 bytes");
+                std::process::exit(1);
+            }
+        }
+
         let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-        let log_dir = std::path::PathBuf::from(&xdg).join("murale/logs");
+        let ns = supervisor::output_namespace(cli.output.as_deref());
+        let log_dir = std::path::PathBuf::from(&xdg).join("murale").join(&ns).join("logs");
         let _ = std::fs::create_dir_all(&log_dir);
         match std::fs::OpenOptions::new()
             .create(true)
@@ -1602,9 +1612,20 @@ fn main() {
                 tracing_subscriber::fmt().with_env_filter(filter).init();
             }
         }
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+
+        let result = if cli.no_recycle {
+            run(cli)
+        } else {
+            supervisor::run_supervisor(cli)
+        };
+        if let Err(e) = result {
+            tracing::error!("{e:#}");
+            std::process::exit(1);
+        }
+        return;
     }
+
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let result = if is_renderer {
         let filtered: Vec<&str> = std::iter::once(args[0].as_str())
@@ -1618,11 +1639,7 @@ fn main() {
         run(cli)
     } else {
         let cli = Cli::parse();
-        if cli.no_recycle {
-            run(cli)
-        } else {
-            supervisor::run_supervisor(cli)
-        }
+        run(cli)
     };
 
     if let Err(e) = result {
