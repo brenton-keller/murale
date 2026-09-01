@@ -119,6 +119,10 @@ pub struct Cli {
     #[arg(long)]
     pub scanout: bool,
 
+    /// List available display outputs and exit
+    #[arg(long)]
+    pub list_outputs: bool,
+
     /// Run without automatic memory recycling (single process, may leak on NVIDIA)
     #[arg(long)]
     pub no_recycle: bool,
@@ -1571,8 +1575,81 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+struct OutputQuery {
+    registry_state: RegistryState,
+    output_state: OutputState,
+}
+
+impl OutputHandler for OutputQuery {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+    fn new_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+    fn update_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+    fn output_destroyed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl ProvidesRegistryState for OutputQuery {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    registry_handlers![OutputState];
+}
+
+delegate_output!(OutputQuery);
+delegate_registry!(OutputQuery);
+
+fn list_outputs() -> Result<()> {
+    let conn = Connection::connect_to_env()
+        .context("could not connect to Wayland compositor (is a Wayland session running?)")?;
+    let (globals, mut event_queue) = registry_queue_init(&conn)
+        .map_err(|e| anyhow::anyhow!("Wayland registry init failed: {e}"))?;
+    let qh = event_queue.handle();
+    let output_state = OutputState::new(&globals, &qh);
+    let mut state = OutputQuery {
+        registry_state: RegistryState::new(&globals),
+        output_state,
+    };
+    event_queue.roundtrip(&mut state)?;
+    for output in state.output_state.outputs() {
+        if let Some(info) = state.output_state.info(&output) {
+            if let Some(name) = &info.name {
+                println!("{name}");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|s| s == "--list-outputs") {
+        if let Err(e) = list_outputs() {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let is_renderer = args
         .get(1)
         .map(|s| s == "__internal-renderer")
