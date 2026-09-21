@@ -43,7 +43,7 @@
             buildInputs = with pkgs; [
               wayland
               libxkbcommon
-              mpv
+              mpv-unwrapped
             ];
 
             meta = with pkgs.lib; {
