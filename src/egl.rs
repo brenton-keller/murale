@@ -9,10 +9,35 @@ use crate::error::MuraleError;
 
 pub type EglInstance = egl::DynamicInstance<egl::EGL1_5>;
 
+// R2-B1: egl::Int (i32), not egl::Attrib (usize) — choose_first_config takes &[Int]
+pub const CONFIG_ATTRIBS: [egl::Int; 13] = [
+    egl::SURFACE_TYPE,
+    egl::WINDOW_BIT,
+    egl::RENDERABLE_TYPE,
+    egl::OPENGL_BIT,
+    egl::RED_SIZE,
+    8,
+    egl::GREEN_SIZE,
+    8,
+    egl::BLUE_SIZE,
+    8,
+    egl::ALPHA_SIZE,
+    8,
+    egl::NONE,
+];
+
+pub const GL_VERSIONS: [(egl::Int, egl::Int); 8] = [
+    (4, 6),
+    (4, 5),
+    (4, 4),
+    (4, 3),
+    (4, 2),
+    (4, 1),
+    (4, 0),
+    (3, 3),
+];
+
 pub struct EglState {
-    pub egl: Arc<EglInstance>,
-    pub display: egl::Display,
-    pub context: egl::Context,
     pub surface: egl::Surface,
     pub egl_window: WlEglSurface,
 }
@@ -29,49 +54,17 @@ pub fn init_display(
     egl: &Arc<EglInstance>,
     wl_display_ptr: *mut c_void,
 ) -> Result<(egl::Display, egl::Config, egl::Context), MuraleError> {
-    // eglGetDisplay is simpler than eglGetPlatformDisplay and
-    // works reliably with NVIDIA's egl-wayland layer.
     let display = unsafe { egl.get_display(wl_display_ptr as egl::NativeDisplayType) }
         .ok_or_else(|| MuraleError::Egl("eglGetDisplay returned EGL_NO_DISPLAY".into()))?;
 
     egl.initialize(display)?;
     egl.bind_api(egl::OPENGL_API)?;
 
-    let config_attribs = [
-        egl::SURFACE_TYPE,
-        egl::WINDOW_BIT,
-        egl::RENDERABLE_TYPE,
-        egl::OPENGL_BIT,
-        egl::RED_SIZE,
-        8,
-        egl::GREEN_SIZE,
-        8,
-        egl::BLUE_SIZE,
-        8,
-        egl::ALPHA_SIZE,
-        8,
-        egl::NONE,
-    ];
-
     let config = egl
-        .choose_first_config(display, &config_attribs)?
+        .choose_first_config(display, &CONFIG_ATTRIBS)?
         .ok_or_else(|| MuraleError::Egl("no suitable EGL config found".into()))?;
 
-    let gl_versions = [
-        (4, 6),
-        (4, 5),
-        (4, 4),
-        (4, 3),
-        (4, 2),
-        (4, 1),
-        (4, 0),
-        (3, 3),
-        (3, 2),
-        (3, 1),
-        (3, 0),
-    ];
-
-    let context = gl_versions
+    let context = GL_VERSIONS
         .iter()
         .find_map(|&(major, minor)| {
             let ctx_attribs = [
@@ -81,11 +74,10 @@ pub fn init_display(
                 minor,
                 egl::NONE,
             ];
-            egl.create_context(display, config, None, &ctx_attribs)
-                .ok()
+            egl.create_context(display, config, None, &ctx_attribs).ok()
         })
         .ok_or_else(|| {
-            MuraleError::Egl("failed to create OpenGL context (tried 4.6 down to 3.0)".into())
+            MuraleError::Egl("failed to create OpenGL context (tried 4.6 down to 3.3)".into())
         })?;
 
     egl.make_current(display, None, None, Some(context))?;
@@ -101,6 +93,68 @@ pub fn init_display(
     Ok((display, config, context))
 }
 
+/// Re-initialize an EGL display after `eglTerminate`. EGL 1.5 spec §3.2
+/// guarantees the same display handle is valid for `eglInitialize` after
+/// termination. On any failure, partially-created state is rolled back
+/// (new context destroyed, display re-terminated) before returning.
+pub fn reinit_display(
+    egl: &Arc<EglInstance>,
+    display: egl::Display,
+) -> Result<(egl::Config, egl::Context), MuraleError> {
+    egl.initialize(display)
+        .map_err(|e| MuraleError::Egl(format!("eglInitialize failed after terminate: {e}")))?;
+
+    egl.bind_api(egl::OPENGL_API).map_err(|e| {
+        let _ = egl.terminate(display);
+        MuraleError::Egl(format!("bind_api failed after reinit: {e}"))
+    })?;
+
+    let config = egl
+        .choose_first_config(display, &CONFIG_ATTRIBS)
+        .map_err(|e| {
+            let _ = egl.terminate(display);
+            MuraleError::Egl(format!("choose_config failed: {e}"))
+        })?
+        .ok_or_else(|| {
+            let _ = egl.terminate(display);
+            MuraleError::Egl("no suitable EGL config found".into())
+        })?;
+
+    let context = GL_VERSIONS
+        .iter()
+        .find_map(|&(major, minor)| {
+            let ctx_attribs = [
+                egl::CONTEXT_MAJOR_VERSION,
+                major,
+                egl::CONTEXT_MINOR_VERSION,
+                minor,
+                egl::NONE,
+            ];
+            egl.create_context(display, config, None, &ctx_attribs).ok()
+        })
+        .ok_or_else(|| {
+            let _ = egl.terminate(display);
+            MuraleError::Egl("failed to create OpenGL context (tried 4.6 down to 3.3)".into())
+        })?;
+
+    if let Err(e) = egl.make_current(display, None, None, Some(context)) {
+        let _ = egl.destroy_context(display, context);
+        let _ = egl.terminate(display);
+        return Err(MuraleError::Egl(format!(
+            "make_current failed after reinit: {e}"
+        )));
+    }
+
+    gl::load_with(|s| {
+        egl.get_proc_address(s)
+            .map(|f| f as *const c_void)
+            .unwrap_or(std::ptr::null())
+    });
+
+    tracing::debug!("EGL re-initialized after terminate");
+    Ok((config, context))
+}
+
 pub fn create_surface(
     egl: &Arc<EglInstance>,
     display: egl::Display,
@@ -113,14 +167,12 @@ pub fn create_surface(
     let egl_window = WlEglSurface::new(wl_surface.id(), width, height)
         .map_err(|_| MuraleError::Egl("failed to create wl_egl_window".into()))?;
 
-    let surface = unsafe {
-        egl.create_window_surface(display, config, egl_window.ptr() as _, None)
-    }?;
+    let surface =
+        unsafe { egl.create_window_surface(display, config, egl_window.ptr() as _, None) }?;
 
     egl.make_current(display, Some(surface), Some(surface), Some(context))?;
     egl.swap_interval(display, 0)?;
 
-    // NVIDIA workaround: force GL_BACK draw buffer
     unsafe {
         gl::DrawBuffer(gl::BACK);
         gl::ClearColor(0.0, 0.0, 0.0, 0.0);
@@ -129,9 +181,6 @@ pub fn create_surface(
     tracing::debug!("EGL surface created ({width}x{height})");
 
     Ok(EglState {
-        egl: egl.clone(),
-        display,
-        context,
         surface,
         egl_window,
     })
@@ -143,10 +192,13 @@ pub fn mpv_get_proc_address(egl: &Arc<EglInstance>, name: &str) -> *mut c_void {
         .unwrap_or(std::ptr::null_mut())
 }
 
-impl Drop for EglState {
-    fn drop(&mut self) {
+impl EglState {
+    pub fn destroy(self, egl: &EglInstance, display: egl::Display) -> Result<(), MuraleError> {
         tracing::debug!("destroying EGL surface");
-        let _ = self.egl.make_current(self.display, None, None, None);
-        let _ = self.egl.destroy_surface(self.display, self.surface);
+        egl.make_current(display, None, None, None)
+            .map_err(|e| MuraleError::Egl(format!("unbind failed: {e}")))?;
+        egl.destroy_surface(display, self.surface)
+            .map_err(|e| MuraleError::Egl(format!("destroy_surface failed: {e}")))?;
+        Ok(())
     }
 }

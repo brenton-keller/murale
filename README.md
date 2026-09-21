@@ -10,13 +10,13 @@ A lean, memory-safe video wallpaper player for Wayland compositors. Built with R
 
 [mpvpaper](https://github.com/GhostNaN/mpvpaper) is the standard video wallpaper tool for Wayland, but it has well-documented problems: a [memory leak](https://github.com/GhostNaN/mpvpaper/issues/101) that grows to 7+ GB over hours, [segfaults on monitor disconnect](https://github.com/GhostNaN/mpvpaper/issues/97), and a two-process architecture that doubles resource usage.
 
-murale fixes all of this in ~600 lines of Rust:
+murale fixes all of this in ~2,000 lines of Rust:
 
 | | murale | mpvpaper |
 |---|---|---|
-| **Memory (4K HEVC, 7680x2160)** | **640 MB stable** | 7.6 GB and growing |
-| **Memory leak** | None | [Yes](https://github.com/GhostNaN/mpvpaper/issues/117) |
-| **Processes** | 1 | 2 (mpvpaper + mpvpaper-holder) |
+| **Memory (4K HEVC, 7680x2160)** | **~530 MB per generation** | 7.6 GB and growing |
+| **Memory leak** | Bounded by automatic process recycling | [Yes](https://github.com/GhostNaN/mpvpaper/issues/117) |
+| **Processes** | 1 binary (self-recycling) | 2 (mpvpaper + mpvpaper-holder) |
 | **Frame pacing (240Hz)** | 0 delayed frames | Smooth but leaking |
 | **Language** | Rust | C |
 | **Crash on monitor disconnect** | No | [Yes](https://github.com/GhostNaN/mpvpaper/issues/97) |
@@ -25,7 +25,8 @@ murale fixes all of this in ~600 lines of Rust:
 
 - **Wayland native** -- uses `wlr-layer-shell` for proper wallpaper surfaces
 - **Hardware decode** -- `hwdec=auto` for GPU-accelerated video decode (NVDEC, VAAPI)
-- **Single process** -- no holder binary, no process swapping
+- **Per-workspace videos** -- different wallpapers per Hyprland workspace via `--workspace`
+- **Self-recycling** -- automatically recycles the renderer every 2h with a seamless dual-process handoff, bounding NVIDIA EGL memory permanently
 - **mpv IPC** -- full mpv command interface via `input-ipc-server` socket
 - **Frame-perfect pacing** -- non-blocking render with compositor frame callback synchronization
 - **Minimal output** -- two log lines by default, detailed stats with `--stats`
@@ -88,6 +89,37 @@ murale ~/Videos/wallpaper.mp4 --mpv-options "input-ipc-server=/tmp/murale.sock"
 
 # Monitor frame timing and playback stats
 murale ~/Videos/wallpaper.mp4 --stats
+```
+
+### Per-workspace videos
+
+On Hyprland, assign different wallpapers to each workspace:
+
+```bash
+murale ~/Videos/default.mp4 \
+  --workspace 1=~/Videos/workspace1.mp4 \
+  --workspace 2=~/Videos/workspace2.mp4 \
+  --workspace 3=~/Videos/workspace3.mp4
+```
+
+The default video plays on unmapped workspaces. Switching workspaces changes the wallpaper instantly via mpv's `loadfile`.
+
+### Self-recycling (default)
+
+NVIDIA's EGL driver accumulates ~165 MB/hour of internal state that can only be freed by destroying the process. murale handles this automatically: it runs a lightweight supervisor that spawns renderer children, and every 2 hours launches a fresh renderer synced to the current video position, then retires the old one — no visible interruption. Each generation starts at ~530 MB with zero accumulation across handoffs.
+
+This is the default behavior. No extra scripts or configuration needed.
+
+To adjust the recycle interval (in seconds):
+
+```bash
+MURALE_REFRESH_INTERVAL=3600 murale ~/Videos/wallpaper.mp4  # recycle every 1h
+```
+
+To disable recycling entirely and run as a single process:
+
+```bash
+murale --no-recycle ~/Videos/wallpaper.mp4
 ```
 
 ### mpv options
