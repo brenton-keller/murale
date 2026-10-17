@@ -58,6 +58,66 @@ extern "C" fn handle_refresh_signal(_sig: libc::c_int) {
 
 const MPV_REFRESH_INTERVAL: Duration = Duration::from_secs(2 * 3600);
 
+// --- scale mismatch detection ---
+
+fn check_scale_mismatch(
+    logical_w: u32,
+    logical_h: u32,
+    scale: u32,
+    mode_w: u32,
+    mode_h: u32,
+) -> bool {
+    let buf_w = logical_w * scale;
+    let buf_h = logical_h * scale;
+    buf_w != mode_w || buf_h != mode_h
+}
+
+#[derive(Debug)]
+struct ScaleMismatchState {
+    pending: bool,
+    warned: bool,
+}
+
+impl ScaleMismatchState {
+    fn new() -> Self {
+        Self {
+            pending: false,
+            warned: false,
+        }
+    }
+
+    fn tick(&mut self, mismatched: bool) -> ScaleMismatchAction {
+        if mismatched {
+            if self.pending {
+                if !self.warned {
+                    self.warned = true;
+                    return ScaleMismatchAction::Warn;
+                }
+                ScaleMismatchAction::None
+            } else {
+                self.pending = true;
+                ScaleMismatchAction::None
+            }
+        } else {
+            let was_warned = self.warned;
+            self.pending = false;
+            self.warned = false;
+            if was_warned {
+                ScaleMismatchAction::Cleared
+            } else {
+                ScaleMismatchAction::None
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ScaleMismatchAction {
+    None,
+    Warn,
+    Cleared,
+}
+
 // --- mpv options parsing ---
 
 fn parse_mpv_options(opts: &str) -> Vec<(&str, &str)> {
@@ -74,6 +134,57 @@ fn parse_mpv_options(opts: &str) -> Vec<(&str, &str)> {
             }
         })
         .collect()
+}
+
+fn normalize_video_path(path: &str) -> String {
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        match std::env::var("HOME") {
+            Ok(home) => format!("{home}/{rest}"),
+            Err(_) => path.to_string(),
+        }
+    } else {
+        path.to_string()
+    };
+    std::path::absolute(&expanded)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(expanded)
+}
+
+fn scaled_buffer_size(logical_w: u32, logical_h: u32, scale: u32) -> (i32, i32) {
+    ((logical_w * scale) as i32, (logical_h * scale) as i32)
+}
+
+#[cfg(test)]
+fn should_defer_surface(target_output: &Option<String>, found: bool) -> bool {
+    target_output.is_some() && !found
+}
+
+fn desired_load(
+    active_ws: &str,
+    map: &HashMap<String, String>,
+    default: &str,
+    playing: &str,
+) -> Option<String> {
+    let desired = map.get(active_ws).map(|v| v.as_str()).unwrap_or(default);
+    if desired != playing {
+        Some(desired.to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn desired_load_connected(
+    active_ws: &str,
+    map: &HashMap<String, String>,
+    default: &str,
+    playing: &str,
+    connected: bool,
+) -> Option<String> {
+    if !connected {
+        return None;
+    }
+    desired_load(active_ws, map, default, playing)
 }
 
 // --- CLI ---
@@ -95,7 +206,7 @@ pub struct Cli {
     pub video: String,
 
     /// Target a specific display output by name (e.g. DP-1, HDMI-A-1).
-    /// Run without this flag to see available outputs listed in the log.
+    /// Use --list-outputs to see available names.
     #[arg(short, long)]
     pub output: Option<String>,
 
@@ -130,6 +241,10 @@ pub struct Cli {
     /// Internal: control channel fd (used by supervisor)
     #[arg(long, hide = true)]
     pub control_fd: Option<i32>,
+
+    /// Internal: initial video path for handoff (overrides positional for first load only)
+    #[arg(long, hide = true)]
+    pub initial_path: Option<String>,
 }
 
 // --- Presentation timing (scanout instrumentation) ---
@@ -213,6 +328,7 @@ struct Murale {
     frame_stats: FrameStats,
     frame_count: u64,
     last_mem_log: Instant,
+    scale_mismatch: ScaleMismatchState,
 
     // Loop restart detection via time-pos backward jump
     loop_count: u64,
@@ -233,15 +349,23 @@ struct Murale {
     release_armed: bool,
 
     exit: bool,
+    handoff_pending: bool,
+    initial_path: Option<String>,
     video_path: String,
     mpv_options: Option<String>,
+
+    // Delayed workspace re-query after monitor reconnect (Fix 2: DPMS phantom events)
+    reconnect_requery: Option<Instant>,
+    workspace_available: bool,
 
     // Workspace config — kept for intent replay during refresh
     workspace_config: Option<(HashMap<String, String>, String)>,
 
     // Hold-mode workspace deferral (shared with workspace listener thread)
+    output_connected: Arc<AtomicBool>,
     hold_active: Arc<AtomicBool>,
     deferred_video: Arc<Mutex<Option<String>>>,
+    ws_mismatch_secs: Arc<std::sync::atomic::AtomicI64>,
 
     // Scanout instrumentation (wp_presentation)
     presentation: Option<wp_presentation::WpPresentation>,
@@ -251,7 +375,45 @@ struct Murale {
 }
 
 impl Murale {
+    fn output_mode_str(&self) -> String {
+        let out_name = self.target_output_name.as_deref().unwrap_or("(any)");
+        if let Some(name) = &self.target_output_name {
+            if let Some(output) = self.find_target_output(name) {
+                if let Some(info) = self.output_state.info(&output) {
+                    if let Some(mode) = info.modes.iter().find(|m| m.current) {
+                        return format!(
+                            "output={out_name} (mode={}x{})",
+                            mode.dimensions.0, mode.dimensions.1
+                        );
+                    }
+                }
+            }
+        }
+        format!("output={out_name}")
+    }
+
+    fn log_surface_state(&self, event: &str) {
+        let buf_w = self.width * self.scale;
+        let buf_h = self.height * self.scale;
+        let mode = self.output_mode_str();
+        tracing::info!(
+            "surface: {event} logical={}x{} scale={} buffer={buf_w}x{buf_h} {mode}",
+            self.width,
+            self.height,
+            self.scale,
+        );
+    }
+
     fn create_layer_surface(&mut self, output: Option<&wl_output::WlOutput>) {
+        debug_assert!(
+            self.layer.is_none(),
+            "create_layer_surface called with existing surface"
+        );
+        if self.layer.is_some() {
+            tracing::warn!("BUG: create_layer_surface called with existing surface — skipping");
+            return;
+        }
+        self.scale = 1;
         let surface = self.compositor_state.create_surface(&self.qh);
         let layer = self.layer_shell.create_layer_surface(
             &self.qh,
@@ -264,11 +426,13 @@ impl Murale {
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_size(0, 0);
+        layer.wl_surface().set_buffer_scale(1);
         layer.commit();
         self.layer = Some(layer);
         self.first_configure = true;
         self.frame_callback_pending = false;
         self.redraw_needed = false;
+        tracing::info!("surface: created {}", self.output_mode_str());
     }
 
     fn teardown_surface(&mut self) {
@@ -304,8 +468,7 @@ impl Murale {
             None => return,
         };
 
-        let w = (self.width * self.scale) as i32;
-        let h = (self.height * self.scale) as i32;
+        let (w, h) = scaled_buffer_size(self.width, self.height, self.scale);
 
         if let Err(e) = self.egl_instance.make_current(
             self.egl_display,
@@ -673,6 +836,7 @@ impl Murale {
                 release_token,
             } => self.handle_prepare_release(id, seq, release_token),
             SupervisorCmd::Unpause { id } => self.handle_unpause(id),
+            SupervisorCmd::HandoffComplete { id } => self.handle_handoff_complete(id),
             SupervisorCmd::Shutdown { id } => self.handle_shutdown(id),
         }
     }
@@ -711,6 +875,7 @@ impl Murale {
             height: mpv
                 .and_then(|m| m.get_property::<i64>("video-out-params/h").ok())
                 .unwrap_or(0) as u32,
+            output_connected: self.output_connected.load(Ordering::Relaxed),
         }
     }
 
@@ -811,6 +976,17 @@ impl Murale {
         }
     }
 
+    fn handle_handoff_complete(&mut self, id: u64) {
+        tracing::info!("handoff complete — workspace listener unlocked");
+        self.handoff_pending = false;
+        if self.workspace_available && self.output_connected.load(Ordering::Relaxed) {
+            self.sync_workspace_video("unlock");
+        }
+        if let Some(ref mut ctrl) = self.ctrl {
+            let _ = ctrl.send_ok(id);
+        }
+    }
+
     fn handle_shutdown(&mut self, _id: u64) {
         tracing::info!("shutdown command received from supervisor");
         self.exit = true;
@@ -856,6 +1032,28 @@ impl Murale {
             }
         }
     }
+
+    fn sync_workspace_video(&self, context: &str) {
+        let (map, default_video) = match &self.workspace_config {
+            Some(cfg) => cfg,
+            None => return,
+        };
+        let mpv = match &self.mpv {
+            Some(m) => m,
+            None => return,
+        };
+        let ws = match workspace::get_active_workspace() {
+            Some(ws) => ws,
+            None => return,
+        };
+        let current_path: String = mpv.get_property("path").unwrap_or_default();
+        if let Some(desired) = desired_load(&ws, map, default_video, &current_path) {
+            tracing::info!("{context}: active workspace = {ws} (was playing {current_path})");
+            let _ = mpv.command("loadfile", &[&desired]);
+        } else {
+            tracing::info!("{context}: active workspace = {ws} (already correct)");
+        }
+    }
 }
 
 // --- SCTK handler implementations ---
@@ -869,10 +1067,12 @@ impl CompositorHandler for Murale {
         new_factor: i32,
     ) {
         self.scale = new_factor as u32;
-        tracing::debug!("scale factor changed to {new_factor}");
+        self.log_surface_state("scale-changed");
+        if let Some(ref layer) = self.layer {
+            layer.wl_surface().set_buffer_scale(new_factor);
+        }
         if let Some(egl_state) = &self.egl_state {
-            let scaled_w = (self.width * self.scale) as i32;
-            let scaled_h = (self.height * self.scale) as i32;
+            let (scaled_w, scaled_h) = scaled_buffer_size(self.width, self.height, self.scale);
             egl_state.egl_window.resize(scaled_w, scaled_h, 0, 0);
             self.redraw_needed = true;
         }
@@ -984,9 +1184,22 @@ impl OutputHandler for Murale {
 
         let name = self.output_state.info(&output).and_then(|i| i.name.clone());
 
-        if name.as_deref() == Some(&target) && self.initialized && self.layer.is_none() {
-            tracing::info!("output {target} reconnected, recreating surface");
-            self.create_layer_surface(Some(&output));
+        if name.as_deref() == Some(&target) && self.layer.is_none() {
+            if self.initialized {
+                tracing::info!("output {target} reconnected, recreating surface");
+                self.output_connected.store(true, Ordering::Relaxed);
+                self.create_layer_surface(Some(&output));
+                if self.workspace_available {
+                    self.sync_workspace_video("reconnect");
+                    self.reconnect_requery = Some(Instant::now() + Duration::from_secs(1));
+                }
+                if let Some(ref mut ctrl) = self.ctrl {
+                    let _ = ctrl.send_event("output_reconnected");
+                }
+            } else {
+                tracing::info!("output {target} appeared, creating deferred surface");
+                self.create_layer_surface(Some(&output));
+            }
         }
     }
 
@@ -1019,7 +1232,11 @@ impl OutputHandler for Murale {
 
         if name.as_deref() == Some(target.as_str()) {
             tracing::info!("output {target} disconnected");
+            self.output_connected.store(false, Ordering::Relaxed);
             self.teardown_surface();
+            if let Some(ref mut ctrl) = self.ctrl {
+                let _ = ctrl.send_event("output_disconnected");
+            }
         }
     }
 }
@@ -1027,6 +1244,7 @@ impl OutputHandler for Murale {
 impl LayerShellHandler for Murale {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
         tracing::warn!("layer surface closed by compositor");
+        self.output_connected.store(false, Ordering::Relaxed);
         self.teardown_surface();
     }
 
@@ -1047,13 +1265,12 @@ impl LayerShellHandler for Murale {
 
         self.width = w;
         self.height = h;
-        tracing::debug!("configure: {w}x{h} scale={}", self.scale);
+        self.log_surface_state("configure");
 
         if self.first_configure {
             self.first_configure = false;
 
-            let scaled_w = (w * self.scale) as i32;
-            let scaled_h = (h * self.scale) as i32;
+            let (scaled_w, scaled_h) = scaled_buffer_size(w, h, self.scale);
 
             let layer = match &self.layer {
                 Some(l) => l,
@@ -1087,7 +1304,8 @@ impl LayerShellHandler for Murale {
             }
 
             if self.mpv.is_none() {
-                if let Err(e) = self.init_mpv() {
+                let load = self.initial_path.take();
+                if let Err(e) = self.init_mpv(load.as_deref()) {
                     tracing::error!("failed to initialize mpv: {e}");
                     self.exit = true;
                     return;
@@ -1113,8 +1331,7 @@ impl LayerShellHandler for Murale {
 
             self.render_frame();
         } else if let Some(egl_state) = &self.egl_state {
-            let scaled_w = (w * self.scale) as i32;
-            let scaled_h = (h * self.scale) as i32;
+            let (scaled_w, scaled_h) = scaled_buffer_size(w, h, self.scale);
             egl_state.egl_window.resize(scaled_w, scaled_h, 0, 0);
         }
     }
@@ -1261,19 +1478,22 @@ fn run(cli: Cli) -> Result<()> {
 
     let is_supervised = ctrl_channel.is_some();
 
+    let video = normalize_video_path(&cli.video);
+    let initial_path = cli.initial_path.as_deref().map(normalize_video_path);
+
     let workspace_map: HashMap<String, String> = cli
         .workspace
         .iter()
         .filter_map(|s| {
             let (k, v) = s.split_once('=')?;
-            Some((k.trim().to_string(), v.trim().to_string()))
+            Some((k.trim().to_string(), normalize_video_path(v.trim())))
         })
         .collect();
 
     let workspace_config = if workspace_map.is_empty() {
         None
     } else {
-        Some((workspace_map, cli.video.clone()))
+        Some((workspace_map, video.clone()))
     };
 
     unsafe {
@@ -1366,6 +1586,7 @@ fn run(cli: Cli) -> Result<()> {
         loop_count: 0,
         last_time_pos: 0.0,
         last_mem_log: Instant::now(),
+        scale_mismatch: ScaleMismatchState::new(),
         ctrl: ctrl_channel,
         generation,
         gen_token,
@@ -1375,11 +1596,17 @@ fn run(cli: Cli) -> Result<()> {
         release_token: [0u8; 16],
         release_armed: false,
         exit: false,
-        video_path: cli.video.clone(),
+        handoff_pending: hold_mode,
+        initial_path,
+        video_path: video.clone(),
         mpv_options: cli.mpv_options,
         workspace_config,
+        reconnect_requery: None,
+        workspace_available: false,
+        output_connected: Arc::new(AtomicBool::new(true)),
         hold_active: Arc::new(AtomicBool::new(hold_mode)),
         deferred_video: Arc::new(Mutex::new(None)),
+        ws_mismatch_secs: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
         presentation,
         wl_display_ptr,
     };
@@ -1393,10 +1620,33 @@ fn run(cli: Cli) -> Result<()> {
 
     if let Some(name) = &cli.output {
         if target_output.is_none() {
-            tracing::warn!("output '{name}' not found, available:");
-            for out in state.output_state.outputs() {
-                if let Some(info) = state.output_state.info(&out) {
-                    tracing::warn!("  {:?}", info.name.as_deref().unwrap_or("(unnamed)"));
+            let available: Vec<String> = state
+                .output_state
+                .outputs()
+                .filter_map(|out| {
+                    state
+                        .output_state
+                        .info(&out)
+                        .and_then(|i| i.name.clone())
+                })
+                .collect();
+            let n_outputs = state.output_state.outputs().count();
+            let since_connect = mem::elapsed_secs();
+            if available.is_empty() {
+                // Inferred: output info may not have arrived after roundtrips
+                // in a freshly-spawned process (Wayland protocol race, unverified).
+                tracing::info!(
+                    "output '{name}' not found ({n_outputs} outputs known, 0 with info, {since_connect:.1}s after connect) — deferring surface until it appears"
+                );
+            } else {
+                tracing::info!(
+                    "output '{name}' not found, available: {} ({since_connect:.1}s after connect) — deferring surface until it appears",
+                    available.join(", ")
+                );
+            }
+            if is_supervised {
+                if let Some(ref mut ctrl) = state.ctrl {
+                    let _ = ctrl.send_waiting_for_output(&available);
                 }
             }
         } else {
@@ -1404,12 +1654,29 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    state.create_layer_surface(target_output.as_ref());
+    if state.layer.is_none() && (target_output.is_some() || cli.output.is_none()) {
+        state.create_layer_surface(target_output.as_ref());
+    }
 
     let wl_fd = conn.as_fd();
     tracing::debug!("entering main loop");
 
     let mut workspace_join_handle: Option<std::thread::JoinHandle<()>> = None;
+    state.workspace_available = if state.workspace_config.is_some() {
+        match std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
+            Ok(_) => true,
+            Err(_) => {
+                tracing::warn!(
+                    "workspace switching disabled: HYPRLAND_INSTANCE_SIGNATURE not set"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    let mut last_output_warn = Instant::now() - Duration::from_secs(600);
 
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
@@ -1504,13 +1771,81 @@ fn run(cli: Cli) -> Result<()> {
         if state.last_mem_log.elapsed().as_secs() >= 30 {
             mem::log_rss("periodic");
             state.last_mem_log = Instant::now();
+
+            if is_supervised && state.layer.is_none() && state.target_output_name.is_some() {
+                if let Some(ref mut ctrl) = state.ctrl {
+                    let available: Vec<String> = state
+                        .output_state
+                        .outputs()
+                        .filter_map(|out| {
+                            state.output_state.info(&out).and_then(|i| i.name.clone())
+                        })
+                        .collect();
+                    let _ = ctrl.send_waiting_for_output(&available);
+                    if last_output_warn.elapsed() >= Duration::from_secs(600) {
+                        tracing::warn!(
+                            "still waiting for target output (available: [{}])",
+                            available.join(", ")
+                        );
+                        last_output_warn = Instant::now();
+                    }
+                }
+            }
+
+            if workspace_join_handle
+                .as_ref()
+                .is_some_and(|h| h.is_finished())
+            {
+                tracing::warn!("[ws] listener exited — respawning");
+                workspace_join_handle = None;
+            }
+
+            // Scale mismatch detector (two-tick debounce)
+            if state.layer.is_some() && state.width > 0 && state.scale > 0 {
+                if let Some(name) = &state.target_output_name {
+                    if let Some(output) = state.find_target_output(name) {
+                        if let Some(info) = state.output_state.info(&output) {
+                            if let Some(mode) = info.modes.iter().find(|m| m.current) {
+                                let (mode_w, mode_h) =
+                                    (mode.dimensions.0 as u32, mode.dimensions.1 as u32);
+                                let mismatched = check_scale_mismatch(
+                                    state.width, state.height, state.scale, mode_w, mode_h,
+                                );
+                                match state.scale_mismatch.tick(mismatched) {
+                                    ScaleMismatchAction::Warn => {
+                                        let buf_w = state.width * state.scale;
+                                        let buf_h = state.height * state.scale;
+                                        tracing::warn!(
+                                            "scale mismatch: buffer={buf_w}x{buf_h} (logical={}x{} scale={}) != mode={mode_w}x{mode_h}",
+                                            state.width, state.height, state.scale,
+                                        );
+                                    }
+                                    ScaleMismatchAction::Cleared => {
+                                        let buf_w = state.width * state.scale;
+                                        let buf_h = state.height * state.scale;
+                                        tracing::info!("scale mismatch cleared: buffer={buf_w}x{buf_h} matches mode");
+                                    }
+                                    ScaleMismatchAction::None => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if mpv_ready {
             state.handle_mpv_wakeup();
         }
 
-        if !state.hold_mode && workspace_join_handle.is_none() {
+        if let Some(deadline) = state.reconnect_requery {
+            if Instant::now() >= deadline {
+                state.reconnect_requery = None;
+                state.sync_workspace_video("reconnect");
+            }
+        }
+
+        if state.workspace_available && !state.hold_mode && !state.handoff_pending && workspace_join_handle.is_none() {
             if let (Some(_), Some((ref map, ref default_video))) =
                 (&state.mpv, &state.workspace_config)
             {
@@ -1520,7 +1855,13 @@ fn run(cli: Cli) -> Result<()> {
                     default_video.clone(),
                     state.hold_active.clone(),
                     state.deferred_video.clone(),
+                    state.output_connected.clone(),
+                    state.target_output_name.clone(),
+                    state.ws_mismatch_secs.clone(),
                 );
+                if !state.handoff_pending && state.output_connected.load(Ordering::Relaxed) {
+                    state.sync_workspace_video("startup");
+                }
             }
         }
 
@@ -1671,12 +2012,45 @@ fn main() {
 
         let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
         let ns = supervisor::output_namespace(cli.output.as_deref());
-        let log_dir = std::path::PathBuf::from(&xdg).join("murale").join(&ns).join("logs");
-        let _ = std::fs::create_dir_all(&log_dir);
+
+        let state_dir = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| {
+            format!(
+                "{}/.local/state",
+                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+            )
+        });
+        let persistent_log_dir =
+            std::path::PathBuf::from(&state_dir).join("murale").join(&ns);
+        let _ = std::fs::create_dir_all(&persistent_log_dir);
+        let _ = std::fs::create_dir_all(persistent_log_dir.join("failed"));
+
+        let tmpfs_log_dir =
+            std::path::PathBuf::from(&xdg).join("murale").join(&ns).join("logs");
+        let _ = std::fs::create_dir_all(&tmpfs_log_dir);
+
+        let sup_log_path = persistent_log_dir.join("supervisor.log");
+        supervisor::rotate_supervisor_log_on_open(&sup_log_path);
+
+        let (sup_log_dir, _fallback) = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sup_log_path)
+        {
+            Ok(_) => (persistent_log_dir.clone(), false),
+            Err(_) => {
+                eprintln!(
+                    "warning: persistent log path failed, using tmpfs: {}",
+                    tmpfs_log_dir.display()
+                );
+                (tmpfs_log_dir.clone(), true)
+            }
+        };
+
+        let sup_log_file_path = sup_log_dir.join("supervisor.log");
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(log_dir.join("supervisor.log"))
+            .open(&sup_log_file_path)
         {
             Ok(file) => {
                 tracing_subscriber::fmt()
@@ -1702,9 +2076,16 @@ fn main() {
         return;
     }
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(!is_renderer)
+        .init();
 
     let result = if is_renderer {
+        unsafe {
+            let name = std::ffi::CString::new("murale-render").unwrap();
+            libc::prctl(libc::PR_SET_NAME, name.as_ptr(), 0usize, 0usize, 0usize);
+        }
         let filtered: Vec<&str> = std::iter::once(args[0].as_str())
             .chain(args[2..].iter().map(|s| s.as_str()))
             .collect();
@@ -1722,5 +2103,206 @@ fn main() {
     if let Err(e) = result {
         tracing::error!("{e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn default_to_mapped() {
+        let map = make_map(&[("2", "/videos/ocean.mp4")]);
+        let result = desired_load("2", &map, "/videos/default.mp4", "/videos/default.mp4");
+        assert_eq!(result, Some("/videos/ocean.mp4".into()));
+    }
+
+    #[test]
+    fn mapped_to_default() {
+        let map = make_map(&[("2", "/videos/ocean.mp4")]);
+        let result = desired_load("1", &map, "/videos/default.mp4", "/videos/ocean.mp4");
+        assert_eq!(result, Some("/videos/default.mp4".into()));
+    }
+
+    #[test]
+    fn unmapped_falls_back_to_default() {
+        let map = make_map(&[("2", "/videos/ocean.mp4")]);
+        let result = desired_load("99", &map, "/videos/default.mp4", "/videos/ocean.mp4");
+        assert_eq!(result, Some("/videos/default.mp4".into()));
+    }
+
+    #[test]
+    fn same_video_returns_none() {
+        let map = make_map(&[("1", "/videos/forest.mp4")]);
+        let result = desired_load("1", &map, "/videos/default.mp4", "/videos/forest.mp4");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn unnormalized_path_does_not_match() {
+        let map = make_map(&[("1", "/home/user/Videos/a.mp4")]);
+        let result = desired_load("1", &map, "/videos/default.mp4", "~/Videos/a.mp4");
+        assert_eq!(result, Some("/home/user/Videos/a.mp4".into()));
+    }
+
+    #[test]
+    fn normalize_expands_tilde() {
+        let result = normalize_video_path("~/Videos/a.mp4");
+        assert!(!result.starts_with("~/"), "tilde should be expanded: {result}");
+        assert!(result.ends_with("/Videos/a.mp4"));
+    }
+
+    #[test]
+    fn normalize_makes_absolute() {
+        let result = normalize_video_path("relative/path.mp4");
+        assert!(
+            result.starts_with('/'),
+            "should be absolute: {result}"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_absolute() {
+        let result = normalize_video_path("/absolute/path.mp4");
+        assert_eq!(result, "/absolute/path.mp4");
+    }
+
+    #[test]
+    fn disconnected_skips_load() {
+        let map = make_map(&[("2", "/videos/ocean.mp4")]);
+        let result =
+            desired_load_connected("2", &map, "/videos/default.mp4", "/videos/default.mp4", false);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn connected_allows_load() {
+        let map = make_map(&[("2", "/videos/ocean.mp4")]);
+        let result =
+            desired_load_connected("2", &map, "/videos/default.mp4", "/videos/default.mp4", true);
+        assert_eq!(result, Some("/videos/ocean.mp4".into()));
+    }
+
+    #[test]
+    fn buffer_size_scale_1() {
+        assert_eq!(scaled_buffer_size(7680, 2160, 1), (7680, 2160));
+    }
+
+    #[test]
+    fn buffer_size_scale_2() {
+        assert_eq!(scaled_buffer_size(7680, 2160, 2), (15360, 4320));
+    }
+
+    #[test]
+    fn buffer_size_zero() {
+        assert_eq!(scaled_buffer_size(0, 0, 2), (0, 0));
+    }
+
+    #[test]
+    fn defer_when_target_absent() {
+        assert!(should_defer_surface(&Some("DP-4".into()), false));
+    }
+
+    #[test]
+    fn no_defer_when_target_found() {
+        assert!(!should_defer_surface(&Some("DP-4".into()), true));
+    }
+
+    #[test]
+    fn no_defer_when_no_target() {
+        assert!(!should_defer_surface(&None, false));
+    }
+
+    #[test]
+    fn unlock_while_disconnected_skips_load() {
+        let map = make_map(&[("5", "/videos/a010.mp4")]);
+        let result =
+            desired_load_connected("5", &map, "/videos/default.mp4", "/videos/default.mp4", false);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn reconnect_loads_active_workspace() {
+        let map = make_map(&[("1", "/videos/a007.mp4"), ("5", "/videos/a010.mp4")]);
+        let result =
+            desired_load_connected("1", &map, "/videos/default.mp4", "/videos/a010.mp4", true);
+        assert_eq!(result, Some("/videos/a007.mp4".into()));
+    }
+
+    #[test]
+    fn scale_mismatch_scale_1_match() {
+        assert!(!check_scale_mismatch(1920, 1080, 1, 1920, 1080));
+    }
+
+    #[test]
+    fn scale_mismatch_scale_2_match() {
+        assert!(!check_scale_mismatch(1920, 1080, 2, 3840, 2160));
+    }
+
+    #[test]
+    fn scale_mismatch_scale_1_wrong_mode() {
+        assert!(check_scale_mismatch(1920, 1080, 1, 3840, 2160));
+    }
+
+    #[test]
+    fn scale_mismatch_scale_2_wrong_buffer() {
+        assert!(check_scale_mismatch(1920, 1080, 2, 1920, 1080));
+    }
+
+    #[test]
+    fn scale_debounce_requires_two_ticks() {
+        let mut s = ScaleMismatchState::new();
+        assert_eq!(s.tick(true), ScaleMismatchAction::None);
+        assert_eq!(s.tick(true), ScaleMismatchAction::Warn);
+    }
+
+    #[test]
+    fn scale_debounce_transient_no_warn() {
+        let mut s = ScaleMismatchState::new();
+        assert_eq!(s.tick(true), ScaleMismatchAction::None);
+        assert_eq!(s.tick(false), ScaleMismatchAction::None);
+        assert_eq!(s.tick(true), ScaleMismatchAction::None);
+        assert_eq!(s.tick(false), ScaleMismatchAction::None);
+    }
+
+    #[test]
+    fn scale_debounce_warn_then_clear() {
+        let mut s = ScaleMismatchState::new();
+        s.tick(true);
+        assert_eq!(s.tick(true), ScaleMismatchAction::Warn);
+        assert_eq!(s.tick(true), ScaleMismatchAction::None);
+        assert_eq!(s.tick(false), ScaleMismatchAction::Cleared);
+    }
+
+    #[test]
+    fn scale_debounce_no_double_warn() {
+        let mut s = ScaleMismatchState::new();
+        s.tick(true);
+        assert_eq!(s.tick(true), ScaleMismatchAction::Warn);
+        assert_eq!(s.tick(true), ScaleMismatchAction::None);
+        assert_eq!(s.tick(true), ScaleMismatchAction::None);
+    }
+
+    #[test]
+    fn unmapped_uses_original_default_not_handoff_path() {
+        let map = make_map(&[("3", "/videos/light01.mp4")]);
+        let original_default = "/videos/a007.mp4";
+        let result = desired_load("11", &map, original_default, "/videos/light01.mp4");
+        assert_eq!(result, Some("/videos/a007.mp4".into()));
+    }
+
+    #[test]
+    fn unmapped_does_not_use_corrupted_default() {
+        let map = make_map(&[("3", "/videos/light01.mp4")]);
+        let corrupted_default = "/videos/light01.mp4";
+        let result = desired_load("11", &map, corrupted_default, "/videos/light01.mp4");
+        assert_eq!(result, None);
     }
 }
