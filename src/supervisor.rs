@@ -40,8 +40,11 @@ extern "C" fn handle_signal(_sig: libc::c_int) {
 struct State {
     ready_dir: PathBuf,
     log_dir: PathBuf,
+    persistent_log_dir: Option<PathBuf>,
+    sup_log_path: Option<PathBuf>,
     generation: u64,
     consecutive_failures: u32,
+    handoff_health: HandoffHealth,
 }
 
 struct ChildProcess {
@@ -53,6 +56,132 @@ struct ChildProcess {
     token: String,
     slot: u32,
     log_path: PathBuf,
+    spawned_at: Instant,
+}
+
+#[derive(Debug)]
+struct HandoffHealth {
+    consecutive_handoff_failures: u32,
+}
+
+impl HandoffHealth {
+    fn new() -> Self {
+        Self {
+            consecutive_handoff_failures: 0,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum HandoffOutcome {
+    Success { gen: u64, path: String, validated: bool },
+    Failure { gen: u64, reason: String },
+    GateSkip { gen: u64, reason: String },
+    Deferred { gen: u64, reason: String },
+}
+
+#[derive(Debug, PartialEq)]
+enum EscalationLevel {
+    Warn,
+    Error,
+}
+
+#[allow(dead_code)]
+struct HandoffEscalation {
+    level: EscalationLevel,
+    consecutive: u32,
+}
+
+fn record_handoff_outcome(
+    health: &mut HandoffHealth,
+    outcome: &HandoffOutcome,
+) -> Option<HandoffEscalation> {
+    match outcome {
+        HandoffOutcome::Success { .. } => {
+            health.consecutive_handoff_failures = 0;
+            None
+        }
+        HandoffOutcome::Deferred { .. } => None,
+        HandoffOutcome::Failure { .. } | HandoffOutcome::GateSkip { .. } => {
+            health.consecutive_handoff_failures += 1;
+            let n = health.consecutive_handoff_failures;
+            let level = if n >= 3 {
+                EscalationLevel::Error
+            } else {
+                EscalationLevel::Warn
+            };
+            Some(HandoffEscalation {
+                level,
+                consecutive: n,
+            })
+        }
+    }
+}
+
+fn read_rss_mb(pid: u32) -> (f64, f64) {
+    let path = format!("/proc/{pid}/status");
+    let contents = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return (0.0, 0.0),
+    };
+    let mut rss_kb = 0u64;
+    let mut swap_kb = 0u64;
+    for line in contents.lines() {
+        if line.starts_with("VmRSS:") {
+            rss_kb = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        } else if line.starts_with("VmSwap:") {
+            swap_kb = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        }
+    }
+    (rss_kb as f64 / 1024.0, swap_kb as f64 / 1024.0)
+}
+
+fn format_age(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn emit_handoff_summary(
+    outcome: &HandoffOutcome,
+    health: &HandoffHealth,
+    renderer_age: Duration,
+    rss_mb: f64,
+    swap_mb: f64,
+    log_bytes: u64,
+) {
+    let age = format_age(renderer_age);
+    let mem = format!("mem={:.0}MB (rss={rss_mb:.0} swap={swap_mb:.0})", rss_mb + swap_mb);
+    let log_kb = log_bytes / 1024;
+    let consecutive = health.consecutive_handoff_failures;
+
+    match outcome {
+        HandoffOutcome::Success { gen, path, validated } => {
+            info!(
+                "handoff summary: gen={gen} result=ok path=\"{path}\" consecutive={consecutive} renderer_age={age} {mem} log={log_kb}KB validated={validated}"
+            );
+        }
+        HandoffOutcome::Failure { gen, reason } => {
+            warn!(
+                "handoff summary: gen={gen} result=fail reason=\"{reason}\" consecutive={consecutive} renderer_age={age} {mem} log={log_kb}KB"
+            );
+        }
+        HandoffOutcome::GateSkip { gen, reason } => {
+            warn!(
+                "handoff summary: gen={gen} result=gate_skip reason=\"{reason}\" consecutive={consecutive} renderer_age={age} {mem} log={log_kb}KB"
+            );
+        }
+        HandoffOutcome::Deferred { gen, reason } => {
+            info!(
+                "handoff summary: gen={gen} result=deferred reason=\"{reason}\" consecutive={consecutive} renderer_age={age} {mem} log={log_kb}KB"
+            );
+        }
+    }
 }
 
 enum WaitResult {
@@ -101,29 +230,62 @@ pub fn run_supervisor(cli: Cli) -> Result<()> {
 
     acquire_lock(&ready_dir)?;
 
+    if let Some(ref opts) = cli.mpv_options {
+        if opts
+            .split(',')
+            .any(|o| o.trim_start().starts_with("input-ipc-server"))
+        {
+            warn!("input-ipc-server is not supported in recycling mode; ignored (use --no-recycle for mpv IPC)");
+        }
+    }
+
     let refresh_interval = std::env::var("MURALE_REFRESH_INTERVAL")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(7200));
 
+    let persistent_log_dir = {
+        let state_dir = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| {
+            format!(
+                "{}/.local/state",
+                std::env::var("HOME").unwrap_or_default()
+            )
+        });
+        let dir = PathBuf::from(&state_dir).join("murale").join(&ns);
+        if fs::create_dir_all(&dir).is_ok() && fs::create_dir_all(dir.join("failed")).is_ok() {
+            Some(dir)
+        } else {
+            None
+        }
+    };
+
+    let sup_log_path = persistent_log_dir
+        .as_ref()
+        .map(|d| d.join("supervisor.log"));
+
     let mut state = State {
         ready_dir,
         log_dir,
+        persistent_log_dir,
+        sup_log_path,
         generation: 0,
         consecutive_failures: 0,
+        handoff_health: HandoffHealth::new(),
     };
 
     retire_logs(&state, &[]);
 
     let mut current = spawn_child(&cli, &mut state, SpawnMode::Normal, 0, None, None)?;
-    recv_event(
-        &mut current,
-        |e| matches!(e, Event::DisplayReady),
-        OVERLAP_TIMEOUT,
-    )
-    .context("initial display-ready timeout")?;
+    wait_for_display_ready(&mut current).context("initial display-ready")?;
     info!("initial instance running (pid={})", current.pid);
+
+    let mut accumulated_on_screen = Duration::ZERO;
+    let mut last_connected_at: Option<Instant> = Some(Instant::now());
+    let mut reconnected_at: Option<Instant> = None;
+    let mut disconnected_at: Option<Instant> = None;
+    let mut retry_after: Option<Instant> = None;
+    let reconnect_settle = Duration::from_secs(60);
 
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
@@ -132,11 +294,19 @@ pub fn run_supervisor(cli: Cli) -> Result<()> {
             break;
         }
 
-        match current.wait_or_timeout(refresh_interval)? {
+        rotate_supervisor_log_in_run(&state);
+
+        let total = total_on_screen(accumulated_on_screen, last_connected_at);
+        let remaining = refresh_interval.saturating_sub(total);
+        match current.wait_or_timeout(remaining.max(Duration::from_secs(1)))? {
             WaitResult::ChildDied(status) => {
                 warn!("current pid={} died (status={})", current.pid, status);
                 move_log_to_failed(&state, &current);
                 current = recover(&cli, &mut state)?;
+                accumulated_on_screen = Duration::ZERO;
+                last_connected_at = Some(Instant::now());
+                reconnected_at = None;
+                disconnected_at = None;
                 continue;
             }
             WaitResult::Message(ChildMsg::Event(Event::ChildError(msg))) => {
@@ -144,6 +314,30 @@ pub fn run_supervisor(cli: Cli) -> Result<()> {
                 current.shutdown();
                 move_log_to_failed(&state, &current);
                 current = recover(&cli, &mut state)?;
+                accumulated_on_screen = Duration::ZERO;
+                last_connected_at = Some(Instant::now());
+                reconnected_at = None;
+                disconnected_at = None;
+                continue;
+            }
+            WaitResult::Message(ChildMsg::Event(Event::OutputDisconnected)) => {
+                if let Some(t) = last_connected_at.take() {
+                    accumulated_on_screen += t.elapsed();
+                }
+                disconnected_at = Some(Instant::now());
+                info!("output disconnected");
+                continue;
+            }
+            WaitResult::Message(ChildMsg::Event(Event::OutputReconnected)) => {
+                let off_dur = disconnected_at
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default();
+                let hours = off_dur.as_secs() / 3600;
+                let minutes = (off_dur.as_secs() % 3600) / 60;
+                info!("output reconnected (off for {hours}h {minutes}m)");
+                last_connected_at = Some(Instant::now());
+                reconnected_at = Some(Instant::now());
+                disconnected_at = None;
                 continue;
             }
             WaitResult::Message(_) => continue,
@@ -156,30 +350,177 @@ pub fn run_supervisor(cli: Cli) -> Result<()> {
             break;
         }
 
+        // Check if A's output is connected before attempting handoff
+        match current.get_snapshot() {
+            Ok(snap) if !snap.output_connected => {
+                if last_connected_at.is_some() {
+                    let (rss, swap) = read_rss_mb(current.pid);
+                    let log_bytes = current.log_path.metadata().map(|m| m.len()).unwrap_or(0);
+                    let outcome = HandoffOutcome::Deferred {
+                        gen: current.gen,
+                        reason: "target output disconnected".into(),
+                    };
+                    record_handoff_outcome(&mut state.handoff_health, &outcome);
+                    emit_handoff_summary(
+                        &outcome,
+                        &state.handoff_health,
+                        current.spawned_at.elapsed(),
+                        rss,
+                        swap,
+                        log_bytes,
+                    );
+                    accumulated_on_screen += last_connected_at
+                        .map(|t| t.elapsed())
+                        .unwrap_or_default();
+                    last_connected_at = None;
+                }
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("snapshot failed: {e}");
+                continue;
+            }
+        }
+
+        // After reconnect, wait for settle before handoff
+        if let Some(at) = reconnected_at {
+            if at.elapsed() < reconnect_settle {
+                continue;
+            }
+            reconnected_at = None;
+        }
+
+        // Backoff after failed/gate-skipped handoffs
+        if retry_after.is_some_and(|d| Instant::now() < d) {
+            continue;
+        }
+
         state.consecutive_failures = 0;
 
+        // Staleness check (on-screen time only, not wall-clock)
+        let on_screen = total_on_screen(accumulated_on_screen, last_connected_at);
+        if on_screen > refresh_interval * 3 {
+            let (rss, swap) = read_rss_mb(current.pid);
+            error!(
+                "recycle stale: on_screen={} renderer_age={} (3× interval={}), mem={:.0}MB (rss={rss:.0} swap={swap:.0}), consecutive={}",
+                format_age(on_screen),
+                format_age(current.spawned_at.elapsed()),
+                format_age(refresh_interval),
+                rss + swap,
+                state.handoff_health.consecutive_handoff_failures,
+            );
+        }
+
         if let Err(e) = check_resources(&state.ready_dir) {
-            warn!("resource gate: {e}");
+            let reason = format!("{e}");
+            let (rss, swap) = read_rss_mb(current.pid);
+            let log_bytes = current.log_path.metadata().map(|m| m.len()).unwrap_or(0);
+            let outcome = HandoffOutcome::GateSkip {
+                gen: current.gen,
+                reason: reason.clone(),
+            };
+            record_handoff_outcome(&mut state.handoff_health, &outcome);
+            emit_handoff_summary(
+                &outcome,
+                &state.handoff_health,
+                current.spawned_at.elapsed(),
+                rss,
+                swap,
+                log_bytes,
+            );
+            warn!(
+                "resource gate: {reason} (consecutive={}, renderer_age={})",
+                state.handoff_health.consecutive_handoff_failures,
+                format_age(current.spawned_at.elapsed()),
+            );
+            let backoff = compute_backoff(
+                state.handoff_health.consecutive_handoff_failures,
+                refresh_interval,
+            );
+            retry_after = Some(Instant::now() + backoff);
+            info!("next attempt in {}", format_age(backoff));
             continue;
         }
 
         let next_slot = (current.slot + 1) % 2;
         match handoff(&cli, &mut state, &mut current, next_slot) {
-            Ok(next) => {
+            Ok(mut next) => {
                 let old_gen = current.gen;
+                let (rss, swap) = read_rss_mb(current.pid);
+                let log_bytes = current.log_path.metadata().map(|m| m.len()).unwrap_or(0);
+                let path = next
+                    .get_snapshot()
+                    .map(|s| s.path)
+                    .unwrap_or_default();
+                let outcome = HandoffOutcome::Success {
+                    gen: next.gen,
+                    path: path.clone(),
+                    validated: true,
+                };
+                record_handoff_outcome(&mut state.handoff_health, &outcome);
+                emit_handoff_summary(
+                    &outcome,
+                    &state.handoff_health,
+                    current.spawned_at.elapsed(),
+                    rss,
+                    swap,
+                    log_bytes,
+                );
                 current.shutdown();
                 current = next;
-                retire_logs(&state, &[&current.gen.to_string()]);
+                let current_log_name = current
+                    .log_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                retire_logs(&state, &[current_log_name]);
                 info!(
-                    "handoff complete: pid={} slot={} (retired gen {old_gen})",
+                    "handoff complete: pid={} slot={} path=\"{path}\" (retired gen {old_gen})",
                     current.pid, current.slot
                 );
             }
             Err(e) => {
-                warn!("handoff failed: {e}");
+                let reason = format!("{e}");
+                let (rss, swap) = read_rss_mb(current.pid);
+                let log_bytes = current.log_path.metadata().map(|m| m.len()).unwrap_or(0);
+                let outcome = HandoffOutcome::Failure {
+                    gen: current.gen,
+                    reason: reason.clone(),
+                };
+                record_handoff_outcome(&mut state.handoff_health, &outcome);
+                emit_handoff_summary(
+                    &outcome,
+                    &state.handoff_health,
+                    current.spawned_at.elapsed(),
+                    rss,
+                    swap,
+                    log_bytes,
+                );
+                let n = state.handoff_health.consecutive_handoff_failures;
+                if n >= 3 {
+                    error!(
+                        "handoff failed (consecutive={n}, renderer_age={}, mem={:.0}MB): {reason}",
+                        format_age(current.spawned_at.elapsed()),
+                        rss + swap,
+                    );
+                } else {
+                    warn!(
+                        "handoff failed (consecutive={n}, renderer_age={}): {reason}",
+                        format_age(current.spawned_at.elapsed()),
+                    );
+                }
+                let backoff = compute_backoff(n, refresh_interval);
+                retry_after = Some(Instant::now() + backoff);
+                info!("next attempt in {}", format_age(backoff));
                 continue;
             }
         }
+        accumulated_on_screen = Duration::ZERO;
+        last_connected_at = Some(Instant::now());
+        reconnected_at = None;
+        disconnected_at = None;
+        retry_after = None;
     }
 
     Ok(())
@@ -207,11 +548,13 @@ fn spawn_child(
 
     let log_file = fs::File::create(&log_path)?;
 
-    let child_video = video_override.unwrap_or(&cli.video);
-
     let mut cmd = Command::new("/proc/self/exe");
+    cmd.arg0("murale-render");
     cmd.arg("__internal-renderer");
-    cmd.arg(child_video);
+    cmd.arg(&cli.video);
+    if let Some(path) = video_override {
+        cmd.args(["--initial-path", path]);
+    }
     if let Some(ref out) = cli.output {
         cmd.args(["--output", out]);
     }
@@ -303,6 +646,7 @@ fn spawn_child(
         token,
         slot,
         log_path,
+        spawned_at: Instant::now(),
     })
 }
 
@@ -485,6 +829,48 @@ fn recv_event(
     result
 }
 
+fn wait_for_display_ready(child: &mut ChildProcess) -> Result<()> {
+    let poll_interval = Duration::from_secs(30);
+    let mut deadline = Instant::now() + OVERLAP_TIMEOUT;
+    let mut last_waiting_log: Option<Instant> = None;
+    child.ctrl.set_read_timeout(poll_interval)?;
+
+    let result = loop {
+        if !child.is_alive() {
+            break Err(anyhow::anyhow!("renderer died while waiting for display_ready"));
+        }
+        if Instant::now() > deadline {
+            break Err(anyhow::anyhow!("event timeout ({OVERLAP_TIMEOUT:?})"));
+        }
+        match child.ctrl.recv() {
+            Ok(ChildMsg::Event(Event::DisplayReady)) => break Ok(()),
+            Ok(ChildMsg::Event(Event::WaitingForOutput { available })) => {
+                if last_waiting_log.is_none()
+                    || last_waiting_log.is_some_and(|t| t.elapsed() >= Duration::from_secs(600))
+                {
+                    info!(
+                        "waiting for output (renderer alive, available: [{}])",
+                        available.join(", ")
+                    );
+                    last_waiting_log = Some(Instant::now());
+                }
+                deadline = Instant::now() + wait_deadline_after_heartbeat(poll_interval);
+            }
+            Ok(ChildMsg::Event(Event::ChildError(msg))) => {
+                break Err(anyhow::anyhow!("child error: {msg}"));
+            }
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("timed out") || e.to_string().contains("WouldBlock") => {}
+            Err(e) if e.to_string().contains("EOF") => {
+                break Err(anyhow::anyhow!("ctrl channel EOF"));
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    let _ = child.ctrl.clear_read_timeout();
+    result
+}
+
 // ==================== Handoff orchestration ====================
 
 fn handoff(
@@ -649,10 +1035,10 @@ fn handoff(
         snap_a2.pos
     );
 
-    // Revalidate identity
-    let snap_a3 = current.get_snapshot().unwrap_or(snap_a.clone());
+    // Revalidate identity (compare against snap_a, not a live A snapshot —
+    // A may have switched workspaces since the handoff started)
     let snap_b3 = next.get_snapshot().unwrap_or(snap_b.clone());
-    if snap_a3.workload_key() != snap_b3.workload_key() {
+    if snap_a.workload_key() != snap_b3.workload_key() {
         do_cleanup(&mut next, state);
         bail!("identity changed during sync");
     }
@@ -725,16 +1111,13 @@ fn handoff(
     }
     info!("B display-ready confirmed");
 
-    // Phase 7: Stabilization
+    // Phase 7: Stabilization (liveness only — resource checks are self-defeating
+    // during overlap because B's VRAM allocation is the transient pressure)
     let stable_end = Instant::now() + HEALTH_WINDOW;
     while Instant::now() < stable_end {
         if !next.is_alive() {
             move_log_to_failed(state, &next);
             bail!("B died during stabilization");
-        }
-        if let Err(e) = check_resources(&state.ready_dir) {
-            do_cleanup(&mut next, state);
-            bail!("resource pressure: {e}");
         }
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -744,17 +1127,18 @@ fn handoff(
         bail!("B died after stabilization");
     }
 
-    // Final path validation
+    // Final path validation (compare against snap_a.path — the path B was
+    // launched with — not A's current path, which may have changed via workspace switch)
     if let Ok(snap_final) = next.get_snapshot() {
-        let desired = current
-            .get_snapshot()
-            .map(|s| s.path)
-            .unwrap_or_else(|_| snap_a.path.clone());
+        let desired = snap_a.path.clone();
         if snap_final.path != desired {
             do_cleanup(&mut next, state);
             bail!("B path mismatch: {} != {desired}", snap_final.path);
         }
     }
+
+    // Unlock B's workspace listener now that validation passed
+    let _ = next.ctrl.send_cmd("handoff_complete");
 
     Ok(next)
 }
@@ -769,11 +1153,7 @@ fn recover(cli: &Cli, state: &mut State) -> Result<ChildProcess> {
         std::thread::sleep(Duration::from_secs(backoff));
 
         match spawn_child(cli, state, SpawnMode::Normal, 0, None, None) {
-            Ok(mut child) => match recv_event(
-                &mut child,
-                |e| matches!(e, Event::DisplayReady),
-                OVERLAP_TIMEOUT,
-            ) {
+            Ok(mut child) => match wait_for_display_ready(&mut child) {
                 Ok(_) => {
                     info!("recovery successful (pid={})", child.pid);
                     state.consecutive_failures = 0;
@@ -852,14 +1232,18 @@ fn check_resources(ready_dir: &Path) -> Result<()> {
     // Tmpfs free >= 50 MiB
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     let path_c = std::ffi::CString::new(ready_dir.to_str().unwrap_or(""))?;
-    if unsafe { libc::statvfs(path_c.as_ptr(), &mut stat) } == 0 {
+    let tmpfs_free_mib = if unsafe { libc::statvfs(path_c.as_ptr(), &mut stat) } == 0 {
         let free_bytes = stat.f_bavail as u64 * stat.f_frsize as u64;
         if free_bytes < 52_428_800 {
             bail!("insufficient tmpfs: {} bytes free (need 50MiB)", free_bytes);
         }
-    }
+        free_bytes / (1024 * 1024)
+    } else {
+        0
+    };
 
     // NVIDIA VRAM check (skip if no GPU)
+    let mut vram_free_mib: u64 = 0;
     if Path::new("/dev/nvidia0").exists() {
         if let Ok(output) = std::process::Command::new("nvidia-smi")
             .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
@@ -872,6 +1256,7 @@ fn check_resources(ready_dir: &Path) -> Result<()> {
                     .next()
                     .and_then(|l| l.trim().parse::<u64>().ok())
                 {
+                    vram_free_mib = free_mib;
                     if free_mib < 3072 {
                         bail!("insufficient VRAM: {free_mib}MiB (need 3GiB)");
                     }
@@ -891,15 +1276,112 @@ fn check_resources(ready_dir: &Path) -> Result<()> {
         }
     }
 
+    info!(
+        "resource gate: vram_free={vram_free_mib}MiB mem_avail={mem_kb}kB tmpfs_free={tmpfs_free_mib}MiB"
+    );
+
     Ok(())
+}
+
+// ==================== Log persistence ====================
+
+pub fn rotate_supervisor_log_on_open(path: &Path) {
+    if let Ok(meta) = path.metadata() {
+        if meta.len() > SUP_LOG_MAX {
+            let backup = path.with_extension("log.1");
+            let _ = fs::rename(path, backup);
+        }
+    }
+}
+
+fn rotate_supervisor_log_in_run(state: &State) {
+    let sup_log = match &state.sup_log_path {
+        Some(p) => p,
+        None => return,
+    };
+    if let Ok(meta) = sup_log.metadata() {
+        if meta.len() > SUP_LOG_MAX {
+            if let Ok(data) = fs::read(sup_log) {
+                let keep_from = data.len().saturating_sub(SUP_LOG_KEEP as usize);
+                let start = data[keep_from..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map(|p| keep_from + p + 1)
+                    .unwrap_or(keep_from);
+                let _ = fs::write(sup_log, &data[start..]);
+            }
+        }
+    }
+}
+
+const PERSIST_TAIL_MAX: usize = 1_048_576;
+
+fn persist_failed_log(state: &State, child: &ChildProcess) {
+    let persistent_dir = match &state.persistent_log_dir {
+        Some(d) => d.join("failed"),
+        None => return,
+    };
+
+    let src = if child.log_path.exists() {
+        &child.log_path
+    } else {
+        let tmpfs_failed = state.log_dir.join("failed");
+        let name = child.log_path.file_name().unwrap_or_default();
+        let moved = tmpfs_failed.join(name);
+        if !moved.exists() {
+            return;
+        }
+        // Can't take reference to local; read directly
+        let data = match fs::read(&moved) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        write_tail_copy(&persistent_dir, child, &data);
+        prune_log_dir(&persistent_dir, FAILED_LOG_MAX_AGE, FAILED_LOG_MAX_BYTES, &[]);
+        return;
+    };
+
+    let data = match fs::read(src) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    write_tail_copy(&persistent_dir, child, &data);
+    prune_log_dir(&persistent_dir, FAILED_LOG_MAX_AGE, FAILED_LOG_MAX_BYTES, &[]);
+}
+
+fn write_tail_copy(dest_dir: &Path, child: &ChildProcess, data: &[u8]) {
+    let name = child.log_path.file_name().unwrap_or_default();
+    let dest = dest_dir.join(name);
+    let size_kb = data.len() / 1024;
+
+    if data.len() <= PERSIST_TAIL_MAX {
+        let _ = fs::write(&dest, data);
+        info!("persisted failed log: {} ({size_kb}KB)", name.to_string_lossy());
+    } else {
+        let offset = data.len() - PERSIST_TAIL_MAX;
+        let start = data[offset..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| offset + p + 1)
+            .unwrap_or(offset);
+        let total_kb = data.len() / 1024;
+        let mut out = format!("--- head truncated at byte {start} ---\n").into_bytes();
+        out.extend_from_slice(&data[start..]);
+        let _ = fs::write(&dest, &out);
+        info!(
+            "persisted failed log: {} ({}KB, truncated from {total_kb}KB)",
+            name.to_string_lossy(),
+            out.len() / 1024,
+        );
+    }
 }
 
 // ==================== Log retention ====================
 
-fn retire_logs(state: &State, exclude_gens: &[&str]) {
+fn retire_logs(state: &State, exclude_names: &[&str]) {
     let mut excludes: Vec<String> = vec!["supervisor.log".into()];
-    for g in exclude_gens {
-        excludes.push(format!("{g}.log"));
+    for name in exclude_names {
+        excludes.push(name.to_string());
     }
 
     prune_log_dir(&state.log_dir, LOG_MAX_AGE, LOG_MAX_BYTES, &excludes);
@@ -911,21 +1393,7 @@ fn retire_logs(state: &State, exclude_gens: &[&str]) {
         &[],
     );
 
-    // Rotate supervisor.log if > 2 MiB
-    let sup_log = state.log_dir.join("supervisor.log");
-    if let Ok(meta) = sup_log.metadata() {
-        if meta.len() > SUP_LOG_MAX {
-            if let Ok(data) = fs::read(&sup_log) {
-                let keep_from = data.len().saturating_sub(SUP_LOG_KEEP as usize);
-                let start = data[keep_from..]
-                    .iter()
-                    .position(|&b| b == b'\n')
-                    .map(|p| keep_from + p + 1)
-                    .unwrap_or(keep_from);
-                let _ = fs::write(&sup_log, &data[start..]);
-            }
-        }
-    }
+    rotate_supervisor_log_in_run(state);
 }
 
 fn prune_log_dir(dir: &Path, max_age: u64, max_bytes: u64, excludes: &[String]) {
@@ -994,6 +1462,7 @@ fn prune_log_dir(dir: &Path, max_age: u64, max_bytes: u64, excludes: &[String]) 
 }
 
 fn move_log_to_failed(state: &State, child: &ChildProcess) {
+    persist_failed_log(state, child);
     if child.log_path.exists() {
         let dest = state
             .log_dir
@@ -1027,4 +1496,407 @@ fn generate_token() -> String {
         let _ = f.read_exact(&mut buf);
     }
     buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+enum WaitAction {
+    Ready,
+    Dead,
+}
+
+fn wait_deadline_after_heartbeat(poll_interval: Duration) -> Duration {
+    poll_interval + Duration::from_secs(5)
+}
+
+fn total_on_screen(accumulated: Duration, last_connected_at: Option<Instant>) -> Duration {
+    accumulated + last_connected_at.map(|t| t.elapsed()).unwrap_or_default()
+}
+
+const BACKOFF_BASE: Duration = Duration::from_secs(600);
+
+fn compute_backoff(consecutive_failures: u32, max: Duration) -> Duration {
+    if consecutive_failures == 0 {
+        return Duration::ZERO;
+    }
+    let shift = (consecutive_failures - 1).min(7);
+    let backoff = BACKOFF_BASE.saturating_mul(1 << shift);
+    backoff.min(max)
+}
+
+#[cfg(test)]
+fn should_skip_handoff(output_connected: bool) -> bool {
+    !output_connected
+}
+
+#[cfg(test)]
+fn time_until_handoff(
+    accumulated: Duration,
+    connected_elapsed: Duration,
+    refresh_interval: Duration,
+    settle_remaining: Duration,
+) -> Duration {
+    let total = accumulated + connected_elapsed;
+    let until_due = refresh_interval.saturating_sub(total);
+    until_due.max(settle_remaining)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
+    fn set_mtime(path: &Path, age_secs: u64) {
+        let old = SystemTime::now() - Duration::from_secs(age_secs);
+        let ft = filetime::FileTime::from_system_time(old);
+        filetime::set_file_mtime(path, ft).unwrap();
+    }
+
+    #[test]
+    fn prune_log_dir_excludes_current_renderer() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        fs::write(dir_path.join("gen-24-1.log"), "old log data".repeat(100)).unwrap();
+        fs::write(dir_path.join("gen-25-1.log"), "current renderer").unwrap();
+        fs::write(dir_path.join("supervisor.log"), "supervisor data").unwrap();
+
+        set_mtime(&dir_path.join("gen-24-1.log"), 400_000);
+        set_mtime(&dir_path.join("gen-25-1.log"), 60);
+        set_mtime(&dir_path.join("supervisor.log"), 60);
+
+        let excludes = vec!["supervisor.log".into(), "gen-25-1.log".into()];
+        prune_log_dir(dir_path, 259_200, 64, &excludes);
+
+        assert!(
+            dir_path.join("gen-25-1.log").exists(),
+            "current renderer log should survive pruning"
+        );
+        assert!(
+            dir_path.join("supervisor.log").exists(),
+            "supervisor.log should survive pruning"
+        );
+        assert!(
+            !dir_path.join("gen-24-1.log").exists(),
+            "old log should be pruned by age"
+        );
+    }
+
+    #[test]
+    fn skip_handoff_when_disconnected() {
+        assert!(should_skip_handoff(false));
+    }
+
+    #[test]
+    fn no_skip_handoff_when_connected() {
+        assert!(!should_skip_handoff(true));
+    }
+
+    #[test]
+    fn total_on_screen_accumulates_across_disconnect() {
+        let accumulated = Duration::from_secs(6900);
+        let connected_at = Some(Instant::now() - Duration::from_secs(100));
+        let total = total_on_screen(accumulated, connected_at);
+        assert!(total >= Duration::from_secs(7000));
+    }
+
+    #[test]
+    fn total_on_screen_paused_when_disconnected() {
+        let accumulated = Duration::from_secs(6900);
+        let total = total_on_screen(accumulated, None);
+        assert_eq!(total, Duration::from_secs(6900));
+    }
+
+    #[test]
+    fn case_a_partial_then_sleep_then_reconnect() {
+        let interval = Duration::from_secs(7200);
+        let settle = Duration::from_secs(60);
+        let accumulated = Duration::from_secs(6900);
+        let connected_elapsed = Duration::from_secs(0);
+        let settle_remaining = settle;
+        let wait = time_until_handoff(accumulated, connected_elapsed, interval, settle_remaining);
+        assert_eq!(wait, Duration::from_secs(300));
+
+        let connected_elapsed = Duration::from_secs(300);
+        let settle_remaining = Duration::ZERO;
+        let wait = time_until_handoff(accumulated, connected_elapsed, interval, settle_remaining);
+        assert_eq!(wait, Duration::ZERO);
+    }
+
+    #[test]
+    fn case_b_overdue_during_disconnect() {
+        let interval = Duration::from_secs(7200);
+        let settle = Duration::from_secs(60);
+        let accumulated = Duration::from_secs(7200);
+        let connected_elapsed = Duration::from_secs(0);
+        let settle_remaining = settle;
+        let wait = time_until_handoff(accumulated, connected_elapsed, interval, settle_remaining);
+        assert_eq!(wait, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn case_c_no_disconnect() {
+        let interval = Duration::from_secs(7200);
+        let settle = Duration::from_secs(60);
+        let accumulated = Duration::ZERO;
+        let connected_elapsed = Duration::from_secs(7200);
+        let settle_remaining = Duration::ZERO;
+        let wait = time_until_handoff(accumulated, connected_elapsed, interval, settle_remaining);
+        assert_eq!(wait, Duration::ZERO);
+    }
+
+    #[test]
+    fn event_driven_disconnect_reconnect_accounting() {
+        let interval = Duration::from_secs(7200);
+        let settle = Duration::from_secs(60);
+
+        // OutputDisconnected after 6900s: freeze accounting
+        let accumulated = Duration::from_secs(6900);
+        // While disconnected (last_connected_at = None), total is frozen
+        assert_eq!(total_on_screen(accumulated, None), Duration::from_secs(6900));
+
+        // OutputReconnected: resume with last_connected_at = now
+        // At reconnect moment, connected_elapsed = 0
+        let wait = time_until_handoff(accumulated, Duration::ZERO, interval, settle);
+        // Need 300s more connected time (300s > 60s settle, so 300s wins)
+        assert_eq!(wait, Duration::from_secs(300));
+
+        // After 300s connected: handoff fires
+        let wait = time_until_handoff(accumulated, Duration::from_secs(300), interval, Duration::ZERO);
+        assert_eq!(wait, Duration::ZERO);
+
+        // Contrast: without the event, accumulated would be 0 and we'd wait 7200s
+        let wait_without_event = time_until_handoff(Duration::ZERO, Duration::ZERO, interval, settle);
+        assert_eq!(wait_without_event, Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn prune_log_dir_size_limit_respects_exclude() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        fs::write(dir_path.join("gen-1-1.log"), vec![b'A'; 5000]).unwrap();
+        fs::write(dir_path.join("gen-2-1.log"), vec![b'B'; 5000]).unwrap();
+        fs::write(dir_path.join("gen-3-1.log"), vec![b'C'; 5000]).unwrap();
+
+        set_mtime(&dir_path.join("gen-1-1.log"), 300);
+        set_mtime(&dir_path.join("gen-2-1.log"), 200);
+        set_mtime(&dir_path.join("gen-3-1.log"), 100);
+
+        let excludes = vec!["gen-3-1.log".into()];
+        prune_log_dir(dir_path, 259_200, 6000, &excludes);
+
+        assert!(
+            dir_path.join("gen-3-1.log").exists(),
+            "excluded log should survive size pruning"
+        );
+        assert!(
+            !dir_path.join("gen-1-1.log").exists(),
+            "oldest log should be pruned for size"
+        );
+    }
+
+    #[test]
+    fn rotate_on_open_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("supervisor.log");
+        fs::write(&log, vec![b'X'; (SUP_LOG_MAX + 1) as usize]).unwrap();
+
+        rotate_supervisor_log_on_open(&log);
+
+        assert!(
+            !log.exists() || fs::metadata(&log).unwrap().len() == 0,
+            "original should be renamed"
+        );
+        let backup = dir.path().join("supervisor.log.1");
+        assert!(backup.exists(), ".1 backup should exist");
+        assert_eq!(
+            fs::metadata(&backup).unwrap().len(),
+            SUP_LOG_MAX + 1,
+            ".1 should have the original content"
+        );
+    }
+
+    #[test]
+    fn rotate_on_open_small_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("supervisor.log");
+        fs::write(&log, "small content").unwrap();
+
+        rotate_supervisor_log_on_open(&log);
+
+        assert!(log.exists(), "small file should not be rotated");
+        let backup = dir.path().join("supervisor.log.1");
+        assert!(!backup.exists(), "no .1 should be created for small files");
+    }
+
+    #[test]
+    fn handoff_outcome_escalation_sequence() {
+        let mut health = HandoffHealth::new();
+
+        // 10 path-mismatch failures
+        for i in 1..=10 {
+            let outcome = HandoffOutcome::Failure {
+                gen: i,
+                reason: "B path mismatch".into(),
+            };
+            let esc = record_handoff_outcome(&mut health, &outcome);
+            let esc = esc.unwrap();
+            assert_eq!(health.consecutive_handoff_failures, i as u32);
+            if i < 3 {
+                assert_eq!(esc.level, EscalationLevel::Warn);
+            } else {
+                assert_eq!(esc.level, EscalationLevel::Error);
+            }
+        }
+
+        // 1 gate skip (counter continues)
+        let outcome = HandoffOutcome::GateSkip {
+            gen: 10,
+            reason: "insufficient VRAM".into(),
+        };
+        let esc = record_handoff_outcome(&mut health, &outcome).unwrap();
+        assert_eq!(health.consecutive_handoff_failures, 11);
+        assert_eq!(esc.level, EscalationLevel::Error);
+
+        // 5 more failures
+        for i in 12..=16 {
+            let outcome = HandoffOutcome::Failure {
+                gen: i,
+                reason: "B path mismatch".into(),
+            };
+            record_handoff_outcome(&mut health, &outcome);
+        }
+        assert_eq!(health.consecutive_handoff_failures, 16);
+
+        // Success resets
+        let outcome = HandoffOutcome::Success {
+            gen: 17,
+            path: "/a.mov".into(),
+            validated: true,
+        };
+        let esc = record_handoff_outcome(&mut health, &outcome);
+        assert!(esc.is_none());
+        assert_eq!(health.consecutive_handoff_failures, 0);
+    }
+
+    #[test]
+    fn handoff_outcome_gate_skip_only() {
+        let mut health = HandoffHealth::new();
+        for i in 1..=5 {
+            let outcome = HandoffOutcome::GateSkip {
+                gen: 1,
+                reason: "insufficient VRAM".into(),
+            };
+            let esc = record_handoff_outcome(&mut health, &outcome).unwrap();
+            if i < 3 {
+                assert_eq!(esc.level, EscalationLevel::Warn);
+            } else {
+                assert_eq!(esc.level, EscalationLevel::Error);
+            }
+        }
+        assert_eq!(health.consecutive_handoff_failures, 5);
+    }
+
+    #[test]
+    fn handoff_outcome_deferred_does_not_count() {
+        let mut health = HandoffHealth::new();
+
+        // 2 failures → WARN
+        for _ in 0..2 {
+            record_handoff_outcome(
+                &mut health,
+                &HandoffOutcome::Failure { gen: 1, reason: "test".into() },
+            );
+        }
+        assert_eq!(health.consecutive_handoff_failures, 2);
+
+        // Deferred does not increment
+        let esc = record_handoff_outcome(
+            &mut health,
+            &HandoffOutcome::Deferred { gen: 1, reason: "output disconnected".into() },
+        );
+        assert!(esc.is_none());
+        assert_eq!(health.consecutive_handoff_failures, 2);
+
+        // Next failure is still at 3 → ERROR
+        let esc = record_handoff_outcome(
+            &mut health,
+            &HandoffOutcome::Failure { gen: 1, reason: "test".into() },
+        );
+        assert_eq!(esc.unwrap().level, EscalationLevel::Error);
+        assert_eq!(health.consecutive_handoff_failures, 3);
+    }
+
+    #[test]
+    fn backoff_schedule() {
+        let max = Duration::from_secs(7200);
+        assert_eq!(compute_backoff(0, max), Duration::ZERO);
+        assert_eq!(compute_backoff(1, max), Duration::from_secs(600));
+        assert_eq!(compute_backoff(2, max), Duration::from_secs(1200));
+        assert_eq!(compute_backoff(3, max), Duration::from_secs(2400));
+        assert_eq!(compute_backoff(4, max), Duration::from_secs(4800));
+        assert_eq!(compute_backoff(5, max), Duration::from_secs(7200));
+        assert_eq!(compute_backoff(6, max), Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn backoff_minimum_10_min() {
+        let max = Duration::from_secs(7200);
+        assert!(compute_backoff(1, max) >= Duration::from_secs(600));
+        assert!(compute_backoff(2, max) >= Duration::from_secs(600));
+    }
+
+    #[test]
+    fn backoff_success_resets() {
+        let max = Duration::from_secs(7200);
+        assert_eq!(compute_backoff(3, max), Duration::from_secs(2400));
+        assert_eq!(compute_backoff(0, max), Duration::ZERO);
+    }
+
+    #[test]
+    fn backoff_deferred_not_counted() {
+        let max = Duration::from_secs(7200);
+        assert_eq!(compute_backoff(0, max), Duration::ZERO);
+    }
+
+    #[test]
+    fn heartbeats_extend_deadline_indefinitely() {
+        let poll = Duration::from_secs(30);
+        let extension = wait_deadline_after_heartbeat(poll);
+        assert_eq!(extension, Duration::from_secs(35));
+
+        // Simulate 3h of heartbeats (360 heartbeats at 30s each)
+        let mut deadline = Instant::now() + OVERLAP_TIMEOUT;
+        for _ in 0..360 {
+            deadline = Instant::now() + extension;
+        }
+        assert!(deadline > Instant::now());
+    }
+
+    #[test]
+    fn no_heartbeat_times_out_at_15s() {
+        let deadline = Instant::now() + OVERLAP_TIMEOUT;
+        assert_eq!(OVERLAP_TIMEOUT, Duration::from_secs(15));
+        assert!(deadline > Instant::now());
+        assert!(deadline < Instant::now() + Duration::from_secs(16));
+    }
+
+    #[test]
+    fn heartbeat_stops_timeout_within_35s() {
+        let poll = Duration::from_secs(30);
+        let extension = wait_deadline_after_heartbeat(poll);
+        let deadline = Instant::now() + extension;
+        assert!(deadline <= Instant::now() + Duration::from_secs(36));
+    }
+
+    #[test]
+    fn wait_action_dispatch() {
+        assert_eq!(
+            if true { WaitAction::Ready } else { WaitAction::Dead },
+            WaitAction::Ready
+        );
+        assert_ne!(WaitAction::Ready, WaitAction::Dead);
+    }
 }

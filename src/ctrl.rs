@@ -67,6 +67,7 @@ pub struct Snapshot {
     pub hwdec: String,
     pub width: u32,
     pub height: u32,
+    pub output_connected: bool,
 }
 
 impl Snapshot {
@@ -104,6 +105,9 @@ pub enum Event {
     ReleaseSent { seq: u64 },
     SwapDone { seq: u64 },
     DisplayReady,
+    WaitingForOutput { available: Vec<String> },
+    OutputDisconnected,
+    OutputReconnected,
     ChildError(String),
 }
 
@@ -205,6 +209,15 @@ fn parse_child_msg(line: &str) -> Result<ChildMsg> {
         let event = match evt {
             "hold_ready" => Event::HoldReady,
             "display_ready" => Event::DisplayReady,
+            "waiting_for_output" => Event::WaitingForOutput {
+                available: obj
+                    .get("available")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default(),
+            },
+            "output_disconnected" => Event::OutputDisconnected,
+            "output_reconnected" => Event::OutputReconnected,
             "target_rendered" => Event::TargetRendered {
                 gen: obj.get("gen").and_then(|v| v.as_u64()).unwrap_or(0),
                 pos: obj.get("pos").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -252,6 +265,7 @@ fn parse_child_msg(line: &str) -> Result<ChildMsg> {
                     .into(),
                 width: snap.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                 height: snap.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                output_connected: snap.get("output_connected").and_then(|v| v.as_bool()).unwrap_or(true),
             };
             return Ok(ChildMsg::Snapshot { id, data });
         }
@@ -304,6 +318,9 @@ pub enum SupervisorCmd {
         release_token: String,
     },
     Unpause {
+        id: u64,
+    },
+    HandoffComplete {
         id: u64,
     },
     Shutdown {
@@ -397,6 +414,7 @@ pub fn parse_supervisor_msg(line: &str) -> Result<SupervisorCmd> {
                 .into(),
         }),
         "unpause" => Ok(SupervisorCmd::Unpause { id }),
+        "handoff_complete" => Ok(SupervisorCmd::HandoffComplete { id }),
         "shutdown" => Ok(SupervisorCmd::Shutdown { id }),
         other => bail!("unknown command: {other}"),
     }
@@ -498,6 +516,7 @@ impl ChildCtrlChannel {
                 "path": snap.path, "pos": snap.pos, "dur": snap.dur,
                 "fps": snap.fps, "codec": snap.codec, "hwdec": snap.hwdec,
                 "width": snap.width, "height": snap.height,
+                "output_connected": snap.output_connected,
             }
         });
         self.send_line(&json.to_string())
@@ -505,6 +524,12 @@ impl ChildCtrlChannel {
 
     pub fn send_event(&mut self, name: &str) -> std::io::Result<()> {
         self.send_line(&serde_json::json!({"event": name}).to_string())
+    }
+
+    pub fn send_waiting_for_output(&mut self, available: &[String]) -> std::io::Result<()> {
+        self.send_line(
+            &serde_json::json!({"event": "waiting_for_output", "available": available}).to_string(),
+        )
     }
 
     pub fn send_target_rendered(&mut self, gen: u64, pos: f64) -> std::io::Result<()> {

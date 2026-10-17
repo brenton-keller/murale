@@ -18,6 +18,34 @@ unsafe impl Send for SendPtr {}
 
 pub(crate) type SharedMpvPtr = Arc<Mutex<SendPtr>>;
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum MpvPath {
+    NoHandle,
+    Unavailable,
+    Path(String),
+}
+
+pub(crate) fn mpv_get_path(shared: &SharedMpvPtr) -> MpvPath {
+    let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let handle = guard.0;
+    if handle.is_null() {
+        return MpvPath::NoHandle;
+    }
+    let name = match CString::new("path") {
+        Ok(n) => n,
+        Err(_) => return MpvPath::NoHandle,
+    };
+    let ptr = unsafe { libmpv2_sys::mpv_get_property_string(handle, name.as_ptr()) };
+    if ptr.is_null() {
+        return MpvPath::Unavailable;
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { libmpv2_sys::mpv_free(ptr as *mut c_void) };
+    MpvPath::Path(s)
+}
+
 pub(crate) fn mpv_loadfile(shared: &SharedMpvPtr, path: &str) -> bool {
     crate::mem::log_rss(&format!("loadfile-before path={path}"));
     let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -77,7 +105,7 @@ pub(crate) fn render_nonblocking(ctx: *mut libmpv2_sys::mpv_render_context, w: i
 const PRE_INIT_OPTIONS: &[&str] = &["config", "config-dir"];
 
 impl Murale {
-    pub(crate) fn init_mpv(&mut self) -> Result<()> {
+    pub(crate) fn init_mpv(&mut self, load_path: Option<&str>) -> Result<()> {
         crate::mem::log_rss("init_mpv-start");
         let user_opts: Vec<(String, String)> = self
             .mpv_options
@@ -148,7 +176,8 @@ impl Murale {
             let _ = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(wakeup_fd_raw) }, &buf);
         });
 
-        mpv.command("loadfile", &[&self.video_path])?;
+        let play_path = load_path.unwrap_or(&self.video_path);
+        mpv.command("loadfile", &[play_path])?;
 
         // SAFETY: RenderContext<'a> borrows Mpv, but we need both in the same struct.
         // This transmute erases the lifetime to 'static. It is sound because:
@@ -166,7 +195,7 @@ impl Murale {
         self.mpv = Some(mpv);
         self.last_mpv_refresh = Instant::now();
 
-        tracing::info!("playing {}", self.video_path);
+        tracing::info!("playing {play_path}");
         crate::mem::log_rss("init_mpv-done");
         Ok(())
     }
@@ -320,7 +349,7 @@ impl Murale {
         crate::mem::log_rss("refresh-after-surface-create");
 
         // Phase F: Rebuild mpv.
-        if let Err(e) = self.init_mpv() {
+        if let Err(e) = self.init_mpv(None) {
             tracing::error!("mpv refresh failed: {e} — shutting down");
             SHUTDOWN.store(true, Ordering::Relaxed);
             self.exit = true;
